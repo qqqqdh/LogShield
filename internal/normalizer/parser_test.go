@@ -1,0 +1,19 @@
+package normalizer
+
+import "testing"
+
+func TestParseLinePreservesQuotedFields(t *testing.T) {
+	ev, err := ParseLine(`2026-01-01T00:00:00Z service=web path="/admin panel" ip=198.51.100.1 status=404 ua="scan bot/1.0"`)
+	if err != nil {
+		t.Fatalf("ParseLine() error = %v", err)
+	}
+	if ev.Path != "/admin panel" {
+		t.Fatalf("Path = %q, want %q", ev.Path, "/admin panel")
+	}
+}
+
+func TestParseLineRejectsUnterminatedQuotedField(t *testing.T) {
+	if _, err := ParseLine(`2026-01-01T00:00:00Z service=web path="/admin`); err == nil {
+		t.Fatal("expected an unterminated quoted field error")
+	}
+}

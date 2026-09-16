@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type Event struct {
@@ -26,7 +27,10 @@ func ParseLine(line string) (Event, error) {
 		return Event{}, errors.New("empty line")
 	}
 
-	parts := strings.Fields(line)
+	parts, err := splitFields(line)
+	if err != nil {
+		return Event{}, err
+	}
 	if len(parts) < 2 {
 		return Event{}, errors.New("invalid line format")
 	}
@@ -49,8 +53,6 @@ func ParseLine(line string) (Event, error) {
 			continue
 		}
 		k, v := kv[0], kv[1]
-		v = strings.Trim(v, `"`)
-
 		switch k {
 		case "service":
 			ev.Service = v
@@ -74,4 +76,52 @@ func ParseLine(line string) (Event, error) {
 	}
 
 	return ev, nil
+}
+
+// splitFields is like strings.Fields but keeps quoted values together. Log
+// fields such as ua="scan bot/1.0" and path="/admin panel" must remain one
+// key=value token for the normalizer to consume them correctly.
+func splitFields(line string) ([]string, error) {
+	fields := make([]string, 0, 8)
+	var field strings.Builder
+	inQuotes := false
+	escaped := false
+
+	flush := func() {
+		if field.Len() == 0 {
+			return
+		}
+		fields = append(fields, field.String())
+		field.Reset()
+	}
+
+	for _, r := range line {
+		if escaped {
+			field.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if inQuotes && r == '\\' {
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+		if unicode.IsSpace(r) && !inQuotes {
+			flush()
+			continue
+		}
+		field.WriteRune(r)
+	}
+
+	if escaped {
+		field.WriteRune('\\')
+	}
+	if inQuotes {
+		return nil, errors.New("unterminated quoted field")
+	}
+	flush()
+	return fields, nil
 }

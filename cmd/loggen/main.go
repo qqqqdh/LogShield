@@ -9,23 +9,14 @@ import (
 	"strings"
 	"time"
 
+	"go-logshield/internal/analyzer"
 	"go-logshield/internal/detector"
-	"go-logshield/internal/normalizer"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nxadm/tail"
 )
 
-type Alert struct {
-	TS       time.Time `json:"ts"`
-	Severity string    `json:"severity"` // 낮음/중간/높음/치명
-	Title    string    `json:"title"`
-	Message  string    `json:"message"`
-
-	IP      string `json:"ip,omitempty"`
-	Service string `json:"service,omitempty"`
-	RuleID  string `json:"rule_id,omitempty"`
-}
+type Alert = detector.Result
 
 type alertMsg struct{ a Alert }
 
@@ -42,6 +33,7 @@ type model struct {
 	mode     viewMode
 
 	alerts   []Alert
+	pending  []Alert
 	selected int
 
 	statusLine string
@@ -57,6 +49,7 @@ func initialModel() model {
 		showHelp:   true,
 		mode:       viewList,
 		alerts:     make([]Alert, 0, 100),
+		pending:    make([]Alert, 0, maxStoredAlerts),
 		selected:   0,
 		statusLine: "실시간 로그 분석 시작됨 (q 종료, p 일시정지)",
 	}
@@ -65,6 +58,9 @@ func initialModel() model {
 type savedMsg struct{ path string }
 type errMsg struct{ err error }
 type eventCountMsg struct{ n int }
+type statusMsg struct{ text string }
+
+const maxStoredAlerts = 100
 
 func saveReportCmd(alerts []Alert) tea.Cmd {
 	snapshot := make([]Alert, len(alerts))
@@ -95,6 +91,21 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
+func (m *model) appendAlert(a Alert) {
+	if len(m.alerts) >= maxStoredAlerts {
+		m.alerts = m.alerts[1:]
+		m.selected = clamp(m.selected-1, 0, len(m.alerts)-1)
+	}
+	m.alerts = append(m.alerts, a)
+	m.selected = clamp(m.selected, 0, len(m.alerts)-1)
+}
+
+func (m *model) queueAlert(a Alert) {
+	if len(m.pending) >= maxStoredAlerts {
+		m.pending = m.pending[1:]
+	}
+	m.pending = append(m.pending, a)
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch x := msg.(type) {
@@ -115,12 +126,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.paused {
 				m.statusLine = "⏸ 일시정지됨 (p로 재개) — 경고는 잠깐 멈춤"
 			} else {
+				for _, alert := range m.pending {
+					m.appendAlert(alert)
+				}
+				m.pending = nil
 				m.statusLine = "▶ 분석 재개됨"
 			}
 			return m, nil
 
 		case "c":
 			m.alerts = nil
+			m.pending = nil
 			m.selected = 0
 			m.mode = viewList
 			m.totalEvents = 0
@@ -176,26 +192,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case alertMsg:
+		m.totalAlerts++
 		if m.paused {
+			m.queueAlert(x.a)
 			return m, nil
 		}
-		m.totalAlerts++
-		// 최대 100개만 보관(메모리/화면 관리)
-		if len(m.alerts) >= 100 {
-			// 오래된 것 제거(앞에서 하나 제거)
-			m.alerts = m.alerts[1:]
-			// selected도 조정
-			m.selected = clamp(m.selected-1, 0, len(m.alerts)-1)
-		}
-		m.alerts = append(m.alerts, x.a)
-		m.selected = clamp(m.selected, 0, len(m.alerts)-1)
+		m.appendAlert(x.a)
 		m.statusLine = fmt.Sprintf("🚨 새 경고: %s", x.a.Title)
 		return m, nil
 
 	case eventCountMsg:
-		if !m.paused {
-			m.totalEvents += x.n
-		}
+		m.totalEvents += x.n
 		return m, nil
 
 	case savedMsg:
@@ -204,6 +211,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case errMsg:
 		m.statusLine = fmt.Sprintf("❌ 오류: %v", x.err)
+		return m, nil
+
+	case statusMsg:
+		m.statusLine = x.text
 		return m, nil
 	}
 
@@ -296,12 +307,7 @@ func startRealtimePipeline(p *tea.Program, logDir string) (stopFn func(), err er
 		return func() {}, nil
 	}
 
-	bruteForceDetector := detector.NewBruteForceDetector(detector.BruteForceConfig{
-		Window:    20 * time.Second,
-		Threshold: 5,
-	})
-	sshBruteForceDetector := detector.NewSSHBruteForceDetector(30*time.Second, 6)
-	webEnumDetector := detector.NewWebEnumDetector(30*time.Second, 4)
+	engine := analyzer.NewDefault()
 
 	tailers := make([]*tail.Tail, 0, len(paths))
 
@@ -332,38 +338,20 @@ func startRealtimePipeline(p *tea.Program, logDir string) (stopFn func(), err er
 
 				p.Send(eventCountMsg{n: 1})
 
-				ev, err := normalizer.ParseLine(raw)
+				_, results, err := engine.ProcessLine(raw)
 				if err != nil {
 					p.Send(errMsg{err: fmt.Errorf("parse error (%s): %v", path, err)})
 					continue
 				}
 
-				// detector.Result를 직접 사용 — 메시지 파싱 불필요
-				detectors := []interface {
-					Process(normalizer.Event) (detector.Result, bool)
-				}{
-					bruteForceDetector,
-					sshBruteForceDetector,
-					webEnumDetector,
-				}
-				for _, d := range detectors {
-					if r, ok := d.Process(ev); ok {
-						p.Send(alertMsg{a: Alert{
-							TS:       time.Now(),
-							Severity: r.Severity,
-							Title:    r.Title,
-							Message:  r.Message,
-							IP:       r.IP,
-							Service:  r.Service,
-							RuleID:   r.RuleID,
-						}})
-					}
+				for _, result := range results {
+					p.Send(alertMsg{a: result})
 				}
 			}
 		}()
 	}
 
-	p.Send(errMsg{err: fmt.Errorf("실시간 tail 시작: %d개 파일 (%s)", len(tailers), pattern)})
+	p.Send(statusMsg{text: fmt.Sprintf("실시간 tail 시작: %d개 파일 (%s)", len(tailers), pattern)})
 
 	// 모든 tailer를 정리하는 함수 반환
 	return func() {
@@ -380,22 +368,21 @@ func main() {
 
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 
-	var stopPipeline func()
+	pipelineReady := make(chan func(), 1)
 	go func() {
 		stop, err := startRealtimePipeline(p, *logDir)
 		if err != nil {
 			p.Send(errMsg{err: err})
 			stop = func() {}
 		}
-		stopPipeline = stop
+		pipelineReady <- stop
 	}()
 
-	if _, err := p.Run(); err != nil {
-		panic(err)
-	}
-
-	// TUI 종료 후 tailer goroutine 정리
-	if stopPipeline != nil {
-		stopPipeline()
+	_, runErr := p.Run()
+	// TUI 종료 후 tailer goroutine 정리. 시작 goroutine이 아직 준비 중이어도
+	// 채널에서 cleanup 함수를 받은 뒤 반드시 정리한다.
+	(<-pipelineReady)()
+	if runErr != nil {
+		panic(runErr)
 	}
 }

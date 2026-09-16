@@ -2,8 +2,11 @@
 package watcher
 
 import (
+	"bufio"
+	"errors"
 	"io"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -16,25 +19,49 @@ func TailFile(path string, out chan<- string, stop <-chan struct{}) error {
 	defer file.Close()
 
 	// 파일의 맨 끝으로 이동
-	offset, _ := file.Seek(0, io.SeekEnd)
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
+	reader := bufio.NewReader(file)
+	var pending string
 
 	for {
 		select {
 		case <-stop:
 			return nil
 		default:
-			// 새로운 데이터 읽기 시도
-			buf := make([]byte, 1024)
-			n, err := file.Read(buf)
-			if n > 0 {
-				out <- string(buf[:n])
-				offset += int64(n)
-				file.Seek(offset, io.SeekStart)
-			} else if err == io.EOF {
-				// 새로운 내용이 없으면 잠시 대기 (폴링 방식)
-				time.Sleep(500 * time.Millisecond)
-			} else {
+			// 줄이 완성될 때까지 보관하여 partial line을 전달하지 않는다.
+			chunk, err := reader.ReadString('\n')
+			pending += chunk
+			if strings.HasSuffix(pending, "\n") {
+				line := strings.TrimSuffix(pending, "\n")
+				line = strings.TrimSuffix(line, "\r")
+				pending = ""
+				select {
+				case out <- line:
+				case <-stop:
+					return nil
+				}
+			}
+			if err == nil {
+				continue
+			}
+			if !errors.Is(err, io.EOF) {
 				return err
+			}
+
+			// 새로운 내용이 없으면 잠시 대기 (폴링 방식)
+			timer := time.NewTimer(500 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-stop:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return nil
 			}
 		}
 	}

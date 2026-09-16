@@ -19,15 +19,15 @@ type BruteForceConfig struct {
 type BruteForceDetector struct {
 	mu       sync.Mutex
 	cfg      BruteForceConfig
-	failures map[string][]time.Time
+	failures *WindowTracker
 	blocked  map[string]time.Time
 }
 
 func NewBruteForceDetector(cfg BruteForceConfig) *BruteForceDetector {
 	return &BruteForceDetector{
 		cfg:      cfg,
-		failures: make(map[string][]time.Time),
-		blocked:  make(map[string]time.Time),
+		failures: NewWindowTracker(cfg.Window, cfg.Threshold, maxTrackedIPs),
+		blocked:  make(map[string]time.Time, maxTrackedIPs),
 	}
 }
 
@@ -53,32 +53,10 @@ func (d *BruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 		delete(d.blocked, ip)
 	}
 
-	// 1) 맵 크기 상한 초과 시 새 IP 무시 (DoS 방지)
-	if _, exists := d.failures[ip]; !exists && len(d.failures) >= maxTrackedIPs {
-		return Result{}, false
-	}
-	// 2) append current failure time
-	d.failures[ip] = append(d.failures[ip], now)
-
-	// 3) evict timestamps outside window
-	cutoff := now.Add(-d.cfg.Window)
-	tsList := d.failures[ip]
-
-	// keep only ts >= cutoff
-	j := 0
-	for _, t := range tsList {
-		if !t.Before(cutoff) {
-			tsList[j] = t
-			j++
-		}
-	}
-	tsList = tsList[:j]
-	d.failures[ip] = tsList
-
-	// 4) threshold check
-	if len(tsList) >= d.cfg.Threshold {
-		first := tsList[0]
-		last := tsList[len(tsList)-1]
+	match, ok := d.failures.Add(ip, now)
+	if ok {
+		first := match.First
+		last := match.Last
 
 		const ruleID = "BRUTE_FORCE_LOGIN"
 		const sev = "high"
@@ -88,17 +66,17 @@ func (d *BruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 			severityKR(sev),
 			ruleTitleKR(ruleID),
 			ip,
-			len(tsList),
+			match.Count,
 			int(d.cfg.Window.Seconds()),
 			first.UTC().Format(time.RFC3339),
 			last.UTC().Format(time.RFC3339),
 			ruleDescKR(ruleID),
 		)
 
-		delete(d.failures, ip)
 		d.blocked[ip] = now
 
 		return Result{
+			TS:       now,
 			RuleID:   ruleID,
 			Title:    ruleTitleKR(ruleID),
 			Severity: severityKR(sev),

@@ -6,19 +6,12 @@ import (
 	"os"
 	"time"
 
+	"go-logshield/internal/detector"
+
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-type Alert struct {
-	TS       time.Time `json:"ts"`
-	Severity string    `json:"severity"`
-	Title    string    `json:"title"`
-	Message  string    `json:"message"`
-
-	IP      string `json:"ip,omitempty"`
-	RuleID  string `json:"rule_id,omitempty"`
-	Service string `json:"service,omitempty"`
-}
+type Alert = detector.Result
 
 type viewMode int
 
