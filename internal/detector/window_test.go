@@ -1,9 +1,40 @@
 package detector
 
 import (
+	"fmt"
+	"go-logshield/internal/normalizer"
 	"testing"
 	"time"
 )
+
+func TestWindowTrackerPrunesIdleKeysOnOtherTraffic(t *testing.T) {
+	tracker := NewWindowTracker(5*time.Second, 3, 10)
+	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	tracker.Add("old", base)
+	tracker.Add("new", base.Add(11*time.Second))
+	if _, exists := tracker.events["old"]; exists {
+		t.Fatal("expired idle key remained after later traffic")
+	}
+}
+
+func TestBruteForceBlockedIPsStayBoundedAndExpire(t *testing.T) {
+	d := NewBruteForceDetector(BruteForceConfig{Window: 5 * time.Second, Threshold: 1})
+	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < maxTrackedIPs; i++ {
+		d.blocked[fmt.Sprintf("ip-%d", i)] = base
+	}
+	ev := normalizer.Event{TS: base.Add(time.Second), Service: "auth", Action: "login", Status: "FAIL", IP: "new"}
+	d.Process(ev)
+	if len(d.blocked) > maxTrackedIPs {
+		t.Fatalf("blocked IPs = %d; maximum = %d", len(d.blocked), maxTrackedIPs)
+	}
+	ev.TS = base.Add(11 * time.Second)
+	ev.IP = "later"
+	d.Process(ev)
+	if _, exists := d.blocked["ip-1"]; exists {
+		t.Fatal("expired blocked IP remained after later traffic")
+	}
+}
 
 func TestWindowTrackerMatchesAndResets(t *testing.T) {
 	tracker := NewWindowTracker(10*time.Second, 3, 10)

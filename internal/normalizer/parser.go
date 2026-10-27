@@ -2,6 +2,9 @@ package normalizer
 
 import (
 	"errors"
+	"net"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -19,14 +22,29 @@ type Event struct {
 }
 
 func ParseLine(line string) (Event, error) {
-	line = strings.ReplaceAll(line, "\n", "")
-	line = strings.ReplaceAll(line, "\r", "")
-	line = strings.TrimSpace(line)
+	return ParseLineAt(line, time.Now())
+}
 
+// ParseLineAt uses the supplied clock to infer the year and timezone of
+// traditional syslog timestamps, which contain neither.
+func ParseLineAt(line string, reference time.Time) (Event, error) {
+	line = strings.TrimSpace(line)
 	if line == "" {
 		return Event{}, errors.New("empty line")
 	}
+	if ev, matched, err := parseOpenSSH(line, reference); matched {
+		return ev, err
+	}
+	if ev, matched, err := parseWebAccess(line); matched {
+		return ev, err
+	}
+	if !strings.Contains(line, "service=") {
+		return Event{}, errors.New("unsupported log format")
+	}
+	return parseProjectLine(line)
+}
 
+func parseProjectLine(line string) (Event, error) {
 	parts, err := splitFields(line)
 	if err != nil {
 		return Event{}, err
@@ -90,6 +108,54 @@ func ParseLine(line string) (Event, error) {
 	}
 
 	return ev, nil
+}
+
+var openSSHLine = regexp.MustCompile("^(\\w{3}\\s+\\d{1,2}\\s+\\d\\d:\\d\\d:\\d\\d)\\s+\\S+\\s+sshd(?:\\[\\d+\\])?:\\s+(Failed|Accepted)\\s+(?:password|publickey|keyboard-interactive/pam)\\s+for\\s+(?:invalid user\\s+)?(\\S+)\\s+from\\s+(\\S+)\\s+port\\s+\\d+")
+var webAccessLine = regexp.MustCompile("^(\\S+)\\s+\\S+\\s+\\S+\\s+\\[([^]]+)\\]\\s+\"(\\S+)\\s+(\\S+)\\s+HTTP/[0-9.]+\"\\s+(\\d{3})\\s+\\S+(?:\\s+.*)?$")
+
+func parseOpenSSH(line string, reference time.Time) (Event, bool, error) {
+	match := openSSHLine.FindStringSubmatch(line)
+	if match == nil {
+		return Event{}, false, nil
+	}
+	if net.ParseIP(match[4]) == nil {
+		return Event{}, true, errors.New("invalid OpenSSH source IP")
+	}
+	if reference.IsZero() {
+		return Event{}, true, errors.New("missing reference time for syslog")
+	}
+	parsed, err := time.ParseInLocation("Jan _2 15:04:05", match[1], reference.Location())
+	if err != nil {
+		return Event{}, true, err
+	}
+	ts := time.Date(reference.Year(), parsed.Month(), parsed.Day(), parsed.Hour(), parsed.Minute(), parsed.Second(), 0, reference.Location())
+	if ts.After(reference.Add(24 * time.Hour)) {
+		ts = ts.AddDate(-1, 0, 0)
+	}
+	status := "FAIL"
+	if match[2] == "Accepted" {
+		status = "SUCCESS"
+	}
+	return Event{TS: ts, Service: "ssh", Action: "auth", User: match[3], IP: match[4], Status: status, RawLine: line}, true, nil
+}
+
+func parseWebAccess(line string) (Event, bool, error) {
+	match := webAccessLine.FindStringSubmatch(line)
+	if match == nil {
+		return Event{}, false, nil
+	}
+	if net.ParseIP(match[1]) == nil {
+		return Event{}, true, errors.New("invalid web source IP")
+	}
+	ts, err := time.Parse("02/Jan/2006:15:04:05 -0700", match[2])
+	if err != nil {
+		return Event{}, true, err
+	}
+	uri, err := url.ParseRequestURI(match[4])
+	if err != nil {
+		return Event{}, true, err
+	}
+	return Event{TS: ts, Service: "web", Action: strings.ToLower(match[3]), IP: match[1], Status: match[5], Path: uri.Path, RawLine: line}, true, nil
 }
 
 // splitFields keeps quoted values, including spaces, within one key=value token.

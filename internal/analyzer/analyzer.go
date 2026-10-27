@@ -48,6 +48,15 @@ func (a *Analyzer) Process(ev normalizer.Event) []detector.Result {
 	return results
 }
 
+// Prune expires detector state even when a tracked IP stops sending events.
+func (a *Analyzer) Prune(now time.Time) {
+	for _, d := range a.detectors {
+		if p, ok := d.(interface{ Prune(time.Time) }); ok {
+			p.Prune(now)
+		}
+	}
+}
+
 // ProcessLine parses one raw line and runs every detector against it.
 func (a *Analyzer) ProcessLine(line string) (normalizer.Event, []detector.Result, error) {
 	ev, err := normalizer.ParseLine(line)

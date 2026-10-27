@@ -17,10 +17,11 @@ type BruteForceConfig struct {
 }
 
 type BruteForceDetector struct {
-	mu       sync.Mutex
-	cfg      BruteForceConfig
-	failures *WindowTracker
-	blocked  map[string]time.Time
+	mu               sync.Mutex
+	cfg              BruteForceConfig
+	failures         *WindowTracker
+	blocked          map[string]time.Time
+	lastBlockedPrune time.Time
 }
 
 func NewBruteForceDetector(cfg BruteForceConfig) *BruteForceDetector {
@@ -45,6 +46,7 @@ func (d *BruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 
 	ip := ev.IP
 	now := ev.TS
+	d.pruneBlocked(now)
 
 	if blockTime, exists := d.blocked[ip]; exists {
 		if now.Sub(blockTime) < d.cfg.Window {
@@ -73,6 +75,9 @@ func (d *BruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 			ruleDescKR(ruleID),
 		)
 
+		if len(d.blocked) >= maxTrackedIPs {
+			d.evictOldestBlocked()
+		}
 		d.blocked[ip] = now
 
 		return Result{
@@ -88,6 +93,43 @@ func (d *BruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 
 	return Result{}, false
 }
+
+// Prune removes expired per-IP state even if that IP never appears again.
+func (d *BruteForceDetector) Prune(now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.failures.Prune(now)
+	d.pruneBlocked(now)
+}
+
+func (d *BruteForceDetector) pruneBlocked(now time.Time) {
+	if now.IsZero() || d.cfg.Window <= 0 {
+		return
+	}
+	if !d.lastBlockedPrune.IsZero() && now.Before(d.lastBlockedPrune.Add(d.cfg.Window)) && len(d.blocked) < maxTrackedIPs {
+		return
+	}
+	for ip, ts := range d.blocked {
+		if !now.Before(ts.Add(d.cfg.Window)) {
+			delete(d.blocked, ip)
+		}
+	}
+	d.lastBlockedPrune = now
+}
+
+func (d *BruteForceDetector) evictOldestBlocked() {
+	var oldestIP string
+	var oldest time.Time
+	for ip, ts := range d.blocked {
+		if oldestIP == "" || ts.Before(oldest) || (ts.Equal(oldest) && ip < oldestIP) {
+			oldestIP, oldest = ip, ts
+		}
+	}
+	if oldestIP != "" {
+		delete(d.blocked, oldestIP)
+	}
+}
+
 func severityKR(sev string) string {
 	switch sev {
 	case "critical":

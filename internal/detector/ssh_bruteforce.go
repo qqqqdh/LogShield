@@ -19,6 +19,12 @@ func NewSSHBruteForceDetector(window time.Duration, threshold int) *SSHBruteForc
 	}
 }
 
+func (d *SSHBruteForceDetector) Prune(now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.tracker.Prune(now)
+}
+
 func (d *SSHBruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 	if ev.Service != "ssh" || ev.Action != "auth" || ev.Status != "FAIL" {
 		return Result{}, false

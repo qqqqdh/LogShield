@@ -20,6 +20,7 @@ type WindowTracker struct {
 	maxKeys   int
 	events    map[string][]time.Time
 	lastSeen  map[string]time.Time
+	lastPrune time.Time
 }
 
 func NewWindowTracker(window time.Duration, threshold, maxKeys int) *WindowTracker {
@@ -39,6 +40,10 @@ func (t *WindowTracker) Add(key string, now time.Time) (WindowMatch, bool) {
 		return WindowMatch{}, false
 	}
 
+	if t.lastPrune.IsZero() || !now.Before(t.lastPrune.Add(t.window)) {
+		t.Prune(now)
+	}
+
 	if _, exists := t.events[key]; !exists {
 		if t.maxKeys > 0 && len(t.events) >= t.maxKeys {
 			t.evictExpired(now.Add(-t.window))
@@ -49,7 +54,9 @@ func (t *WindowTracker) Add(key string, now time.Time) (WindowMatch, bool) {
 	}
 
 	list := append(t.events[key], now)
-	t.lastSeen[key] = now
+	if seen, exists := t.lastSeen[key]; !exists || now.After(seen) {
+		t.lastSeen[key] = now
+	}
 	sort.Slice(list, func(i, j int) bool {
 		return list[i].Before(list[j])
 	})
@@ -91,6 +98,15 @@ func (t *WindowTracker) Add(key string, now time.Time) (WindowMatch, bool) {
 		t.events[key] = remaining
 	}
 	return match, true
+}
+
+// Prune removes expired history, including keys that have gone idle.
+func (t *WindowTracker) Prune(now time.Time) {
+	if now.IsZero() || t.window <= 0 {
+		return
+	}
+	t.evictExpired(now.Add(-t.window))
+	t.lastPrune = now
 }
 
 func (t *WindowTracker) evictExpired(cutoff time.Time) {

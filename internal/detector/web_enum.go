@@ -45,6 +45,12 @@ func isErrorStatus(status string) bool {
 	return status == "401" || status == "403" || status == "404"
 }
 
+func (d *WebEnumDetector) Prune(now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.tracker.Prune(now)
+}
+
 func (d *WebEnumDetector) Process(ev normalizer.Event) (Result, bool) {
 	if ev.Service != "web" {
 		return Result{}, false
