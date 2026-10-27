@@ -19,4 +19,6 @@ Inputs and expected results:
 
 Run `go run ./cmd/logaudit -input <exact-file.jsonl> -output <local-report.json>` on either branch. The audit command accepts one exact file path, including `.jsonl`; directory-based live commands retain their existing file selection. It reports normalized requests, non-event records, malformed records, missing IPs, statuses and alert totals. It never computes accuracy for unlabeled data.
 
+The LLM branch does not create IP-based sessions for events without a source IP. Its report counts these events explicitly instead of merging unrelated visitors into an empty-IP session.
+
 No production logging configuration or live traffic is modified. A zero alert count with missing source IPs does not establish safety.
