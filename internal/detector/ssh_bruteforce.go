@@ -9,18 +9,20 @@ import (
 )
 
 type SSHBruteForceDetector struct {
-	mu        sync.Mutex
-	window    time.Duration
-	threshold int
-	failures  map[string][]time.Time
+	mu      sync.Mutex
+	tracker *WindowTracker
 }
 
 func NewSSHBruteForceDetector(window time.Duration, threshold int) *SSHBruteForceDetector {
 	return &SSHBruteForceDetector{
-		window:    window,
-		threshold: threshold,
-		failures:  make(map[string][]time.Time),
+		tracker: NewWindowTracker(window, threshold, maxTrackedIPs),
 	}
+}
+
+func (d *SSHBruteForceDetector) Prune(now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.tracker.Prune(now)
 }
 
 func (d *SSHBruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
@@ -37,29 +39,10 @@ func (d *SSHBruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 	ip := ev.IP
 	now := ev.TS
 
-	// 맵 크기 상한 초과 시 새 IP 무시 (DoS 방지)
-	if _, exists := d.failures[ip]; !exists && len(d.failures) >= maxTrackedIPs {
-		return Result{}, false
-	}
-
-	d.failures[ip] = append(d.failures[ip], now)
-
-	cutoff := now.Add(-d.window)
-	list := d.failures[ip]
-
-	j := 0
-	for _, t := range list {
-		if !t.Before(cutoff) {
-			list[j] = t
-			j++
-		}
-	}
-	list = list[:j]
-	d.failures[ip] = list
-
-	if len(list) >= d.threshold {
-		first := list[0]
-		last := list[len(list)-1]
+	match, ok := d.tracker.Add(ip, now)
+	if ok {
+		first := match.First
+		last := match.Last
 
 		const ruleID = "SSH_BRUTE_FORCE"
 		msg := fmt.Sprintf(
@@ -70,14 +53,14 @@ func (d *SSHBruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 				"- 마지막 시각: %s\n"+
 				"- 설명: 동일 IP에서 SSH 인증 실패가 짧은 시간에 반복되었습니다.",
 			ip,
-			len(list),
-			int(d.window.Seconds()),
+			match.Count,
+			int(d.tracker.window.Seconds()),
 			first.Format(time.RFC3339),
 			last.Format(time.RFC3339),
 		)
 
-		delete(d.failures, ip)
 		return Result{
+			TS:       now,
 			RuleID:   ruleID,
 			Title:    "SSH 브루트포스 공격 의심",
 			Severity: "높음",

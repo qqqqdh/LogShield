@@ -17,17 +17,18 @@ type BruteForceConfig struct {
 }
 
 type BruteForceDetector struct {
-	mu       sync.Mutex
-	cfg      BruteForceConfig
-	failures map[string][]time.Time
-	blocked  map[string]time.Time
+	mu               sync.Mutex
+	cfg              BruteForceConfig
+	failures         *WindowTracker
+	blocked          map[string]time.Time
+	lastBlockedPrune time.Time
 }
 
 func NewBruteForceDetector(cfg BruteForceConfig) *BruteForceDetector {
 	return &BruteForceDetector{
 		cfg:      cfg,
-		failures: make(map[string][]time.Time),
-		blocked:  make(map[string]time.Time),
+		failures: NewWindowTracker(cfg.Window, cfg.Threshold, maxTrackedIPs),
+		blocked:  make(map[string]time.Time, maxTrackedIPs),
 	}
 }
 
@@ -45,6 +46,7 @@ func (d *BruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 
 	ip := ev.IP
 	now := ev.TS
+	d.pruneBlocked(now)
 
 	if blockTime, exists := d.blocked[ip]; exists {
 		if now.Sub(blockTime) < d.cfg.Window {
@@ -53,32 +55,10 @@ func (d *BruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 		delete(d.blocked, ip)
 	}
 
-	// 1) 맵 크기 상한 초과 시 새 IP 무시 (DoS 방지)
-	if _, exists := d.failures[ip]; !exists && len(d.failures) >= maxTrackedIPs {
-		return Result{}, false
-	}
-	// 2) append current failure time
-	d.failures[ip] = append(d.failures[ip], now)
-
-	// 3) evict timestamps outside window
-	cutoff := now.Add(-d.cfg.Window)
-	tsList := d.failures[ip]
-
-	// keep only ts >= cutoff
-	j := 0
-	for _, t := range tsList {
-		if !t.Before(cutoff) {
-			tsList[j] = t
-			j++
-		}
-	}
-	tsList = tsList[:j]
-	d.failures[ip] = tsList
-
-	// 4) threshold check
-	if len(tsList) >= d.cfg.Threshold {
-		first := tsList[0]
-		last := tsList[len(tsList)-1]
+	match, ok := d.failures.Add(ip, now)
+	if ok {
+		first := match.First
+		last := match.Last
 
 		const ruleID = "BRUTE_FORCE_LOGIN"
 		const sev = "high"
@@ -88,17 +68,20 @@ func (d *BruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 			severityKR(sev),
 			ruleTitleKR(ruleID),
 			ip,
-			len(tsList),
+			match.Count,
 			int(d.cfg.Window.Seconds()),
 			first.UTC().Format(time.RFC3339),
 			last.UTC().Format(time.RFC3339),
 			ruleDescKR(ruleID),
 		)
 
-		delete(d.failures, ip)
+		if len(d.blocked) >= maxTrackedIPs {
+			d.evictOldestBlocked()
+		}
 		d.blocked[ip] = now
 
 		return Result{
+			TS:       now,
 			RuleID:   ruleID,
 			Title:    ruleTitleKR(ruleID),
 			Severity: severityKR(sev),
@@ -110,6 +93,43 @@ func (d *BruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 
 	return Result{}, false
 }
+
+// Prune removes expired per-IP state even if that IP never appears again.
+func (d *BruteForceDetector) Prune(now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.failures.Prune(now)
+	d.pruneBlocked(now)
+}
+
+func (d *BruteForceDetector) pruneBlocked(now time.Time) {
+	if now.IsZero() || d.cfg.Window <= 0 {
+		return
+	}
+	if !d.lastBlockedPrune.IsZero() && now.Before(d.lastBlockedPrune.Add(d.cfg.Window)) && len(d.blocked) < maxTrackedIPs {
+		return
+	}
+	for ip, ts := range d.blocked {
+		if !now.Before(ts.Add(d.cfg.Window)) {
+			delete(d.blocked, ip)
+		}
+	}
+	d.lastBlockedPrune = now
+}
+
+func (d *BruteForceDetector) evictOldestBlocked() {
+	var oldestIP string
+	var oldest time.Time
+	for ip, ts := range d.blocked {
+		if oldestIP == "" || ts.Before(oldest) || (ts.Equal(oldest) && ip < oldestIP) {
+			oldestIP, oldest = ip, ts
+		}
+	}
+	if oldestIP != "" {
+		delete(d.blocked, oldestIP)
+	}
+}
+
 func severityKR(sev string) string {
 	switch sev {
 	case "critical":
