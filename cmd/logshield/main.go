@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -21,6 +22,8 @@ import (
 )
 
 type FinalReport struct {
+	NonEventRecords       int               `json:"non_event_records"`
+	MissingIPEvents       int               `json:"missing_ip_events"`
 	Timestamp             string            `json:"timestamp"`
 	RuleBasedAlerts       []detector.Result `json:"rule_based_alerts"`
 	LLMICLEvaluations     []llm.ICLResult   `json:"llm_icl_evaluations"`
@@ -168,6 +171,10 @@ func main() {
 	processLogLine := func(line string) {
 		totalLogsRead++
 		ev, err := normalizer.ParseLine(line)
+		if errors.Is(err, normalizer.ErrNonEvent) {
+			report.NonEventRecords++
+			return
+		}
 		if err != nil {
 			parseErrors++
 			if parseErrors <= 10 {
@@ -176,6 +183,9 @@ func main() {
 			return
 		}
 		totalLogs++
+		if ev.IP == "" {
+			report.MissingIPEvents++
+		}
 
 		ruleTriggered := false
 
@@ -196,6 +206,9 @@ func main() {
 		// B) Session Context Aggregation & Smart LLM Triggering
 		if *enableLLM {
 			session := sessionManager.ProcessEvent(ev, ev.TS)
+			if session == nil {
+				return
+			}
 			shouldEval, stats, fingerprint := anomalyEvaluator.ShouldEvaluate(session, ruleTriggered, ev.TS)
 
 			if shouldEval {
@@ -328,7 +341,7 @@ func main() {
 		log.Fatalf("close alert journal: %v", err)
 	}
 	fmt.Printf("\n📊 Analysis complete. Parsed: %d/%d lines; parse errors: %d. Report saved to %s\n", totalLogs, totalLogsRead, parseErrors, *reportFile)
-	if totalLogsRead > 0 && totalLogs == 0 {
+	if parseErrors > 0 && totalLogs == 0 {
 		log.Fatal("no supported log lines were parsed")
 	}
 	if watchFailures > 0 {

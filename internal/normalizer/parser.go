@@ -32,6 +32,9 @@ func ParseLineAt(line string, reference time.Time) (Event, error) {
 	if line == "" {
 		return Event{}, errors.New("empty line")
 	}
+	if strings.HasPrefix(line, "{") {
+		return parseFlyLine(line)
+	}
 	if ev, matched, err := parseOpenSSH(line, reference); matched {
 		return ev, err
 	}

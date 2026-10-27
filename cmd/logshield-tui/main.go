@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"go-logshield/internal/analyzer"
+	"go-logshield/internal/normalizer"
 	"go-logshield/internal/pkg/alertstore"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -46,6 +48,9 @@ func runRealtimeWorker(lines <-chan rawLine, engine *analyzer.Analyzer, journal 
 				return
 			}
 			_, results, err := engine.ProcessLine(item.text)
+			if errors.Is(err, normalizer.ErrNonEvent) {
+				continue
+			}
 			if err != nil {
 				reportError(fmt.Errorf("parse error (%s): %w", item.path, err))
 				continue

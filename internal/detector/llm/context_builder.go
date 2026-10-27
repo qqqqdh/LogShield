@@ -79,20 +79,20 @@ func (s *SessionContext) BuildContext() string {
 
 type SessionContextManagerConfig struct {
 	IdleTTL             time.Duration
-	HardTTL              time.Duration
+	HardTTL             time.Duration
 	MaxSessions         int
 	MaxEventsPerSession int
 }
 
 // SessionContextManager manages isolated session contexts per IP|Service with Idle TTL, Hard TTL Epoch Rollover, and LRU Eviction.
 type SessionContextManager struct {
-	mu                  sync.Mutex
-	config              SessionContextManagerConfig
-	sessions            map[string]*SessionContext
-	lruOrder            []string
-	EvictionsTotal      int64
-	RolloversTotal      int64
-	ExpiredTotal        int64
+	mu             sync.Mutex
+	config         SessionContextManagerConfig
+	sessions       map[string]*SessionContext
+	lruOrder       []string
+	EvictionsTotal int64
+	RolloversTotal int64
+	ExpiredTotal   int64
 }
 
 func NewSessionContextManager(config SessionContextManagerConfig) *SessionContextManager {
@@ -117,7 +117,11 @@ func NewSessionContextManager(config SessionContextManagerConfig) *SessionContex
 }
 
 // ProcessEvent routes a normalized event to its isolated IP|Service session context, enforcing TTLs and LRU eviction.
+// A missing source IP cannot identify a visitor; return nil without creating a session.
 func (m *SessionContextManager) ProcessEvent(ev normalizer.Event, now time.Time) *SessionContext {
+	if strings.TrimSpace(ev.IP) == "" {
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

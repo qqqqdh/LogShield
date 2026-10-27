@@ -14,6 +14,38 @@ import (
 	"go-logshield/internal/pkg/alertstore"
 )
 
+func TestCLIFlyLogsDoNotCreateUnattributedLLMSessions(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	if err := os.Mkdir(logs, 0700); err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{`{"timestamp":"2026-10-28T10:00:00Z","message":"INFO Starting init"}`}
+	for i := 0; i < 4; i++ {
+		lines = append(lines, fmt.Sprintf(`{"timestamp":"2026-10-28T10:00:0%dZ","message":"WARN [404] GET /.env (1ms)"}`, i))
+	}
+	if err := os.WriteFile(filepath.Join(logs, "fly.log"), []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reportPath := filepath.Join(dir, "report.json")
+	cmd := exec.Command("go", "run", ".", "-log-dir", logs, "-llm=true", "-ollama-url", "http://127.0.0.1:1", "-alerts-file", filepath.Join(dir, "alerts.jsonl"), "-report", reportPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI failed: %v\n%s", err, output)
+	}
+	data, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report FinalReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.TotalLogsAnalyzed != 4 || report.NonEventRecords != 1 || report.MissingIPEvents != 4 || report.ParseErrors != 0 || report.ActiveSessions != 0 || len(report.LLMICLEvaluations) != 0 {
+		t.Fatalf("unattributed/platform records incorrectly evaluated: %+v", report)
+	}
+}
+
 func TestReportSnapshotIsBounded(t *testing.T) {
 	report := FinalReport{}
 	for i := 0; i < 101; i++ {

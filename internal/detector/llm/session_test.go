@@ -7,10 +7,19 @@ import (
 	"go-logshield/internal/normalizer"
 )
 
+func TestSessionManagerDoesNotMergeUnattributedEvents(t *testing.T) {
+	mgr := NewSessionContextManager(SessionContextManagerConfig{})
+	now := time.Now()
+	session := mgr.ProcessEvent(normalizer.Event{TS: now, Service: "web", Status: "404", Path: "/.env"}, now)
+	if session != nil || mgr.ActiveSessionsCount() != 0 {
+		t.Fatal("missing-IP event created a shared visitor session")
+	}
+}
+
 func TestSessionContextManager_IsolationAndRollover(t *testing.T) {
 	mgr := NewSessionContextManager(SessionContextManagerConfig{
 		IdleTTL:             5 * time.Minute,
-		HardTTL:              10 * time.Minute,
+		HardTTL:             10 * time.Minute,
 		MaxSessions:         2,
 		MaxEventsPerSession: 10,
 	})
