@@ -21,6 +21,26 @@ Scope: both `main` and the LLM branch. Public website URL is context only; do no
 - Old per-IP state expires without requiring the same IP to appear again. Capacity pressure must not retain stale blocking state.
 - Benchmark accepts a labeled dataset supplied by the operator and reports sample count plus provenance; no claim of production detection accuracy without such data.
 
+## Labeled LLM evaluation
+
+The LLM branch accepts `go run ./cmd/benchmark -dataset labeled.json -output benchmark_report.json`. The JSON file must contain `reference_time` (RFC3339) and a nonempty `samples` array. Each sample needs a unique `id`, `is_attack_ground`, `ground_technique` (`None` for normal), and `events` containing raw log lines. Example:
+
+```json
+{
+  "reference_time": "2026-10-28T12:00:00+09:00",
+  "samples": [
+    {
+      "id": "normal-1",
+      "is_attack_ground": false,
+      "ground_technique": "None",
+      "events": ["2026-10-28T10:00:00+09:00 service=web action=get ip=203.0.113.2 status=200 path=/"]
+    }
+  ]
+}
+```
+
+The benchmark derives the LLM context from the same parsed events used by the rule baseline. Its built-in seven examples are synthetic and only check the evaluation pipeline. `llm_valid_count` and `llm_call_count` distinguish actual model responses from attempts that fell back to rules. An unavailable Ollama endpoint cannot establish model accuracy. To measure detection quality on `skueat.fly.dev`, collect representative access/authentication logs, remove secrets and personal data, label normal and attack sessions independently, and run the benchmark on those samples. A public site URL does not supply those logs.
+
 ## Verification boundary
 
 Run focused red tests before fixes, full Go tests and race tests after. Real-site detection quality, Fly logs, Ollama behavior, and sustained load require user-supplied logs or a controlled environment and are not established by unit tests.
