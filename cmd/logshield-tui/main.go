@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"go-logshield/internal/detector"
@@ -35,16 +37,17 @@ const (
 )
 
 type model struct {
-	alerts      []Alert
-	pending     []Alert
-	selectedIdx int
-	mode        viewMode
-	err         error
-	paused      bool
-	showHelp    bool
-	eventCount  int
-	alertCount  int
-	subChan     chan Alert
+	alerts        []Alert
+	pending       []Alert
+	selectedIdx   int
+	mode          viewMode
+	err           error
+	paused        bool
+	showHelp      bool
+	eventCount    int
+	alertCount    int
+	droppedAlerts int
+	subChan       chan Alert
 }
 
 func initialModel(subChan chan Alert) model {
@@ -75,6 +78,47 @@ func (m *model) appendAlert(a Alert) {
 	}
 }
 
+const maxPausedAlerts = 100
+
+func severityRank(severity string) int {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "치명", "critical":
+		return 4
+	case "높음", "high":
+		return 3
+	case "중간", "medium":
+		return 2
+	case "낮음", "low":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// Keep the most severe alerts. Within one severity, retain newer event times;
+// equal timestamps prefer the alert received later.
+func (m *model) queueAlert(a Alert) {
+	if len(m.pending) < maxPausedAlerts {
+		m.pending = append(m.pending, a)
+		return
+	}
+	worst := 0
+	for i := 1; i < len(m.pending); i++ {
+		candidate, current := m.pending[i], m.pending[worst]
+		if severityRank(candidate.Severity) < severityRank(current.Severity) ||
+			(severityRank(candidate.Severity) == severityRank(current.Severity) && candidate.TS.Before(current.TS)) {
+			worst = i
+		}
+	}
+	current := m.pending[worst]
+	if severityRank(a.Severity) > severityRank(current.Severity) ||
+		(severityRank(a.Severity) == severityRank(current.Severity) && !a.TS.Before(current.TS)) {
+		copy(m.pending[worst:], m.pending[worst+1:])
+		m.pending[len(m.pending)-1] = a
+	}
+	m.droppedAlerts++
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -84,6 +128,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "p":
 			m.paused = !m.paused
 			if !m.paused {
+				sort.SliceStable(m.pending, func(i, j int) bool {
+					return m.pending[i].TS.Before(m.pending[j].TS)
+				})
 				for _, a := range m.pending {
 					m.appendAlert(a)
 				}
@@ -94,6 +141,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pending = nil
 			m.selectedIdx = 0
 			m.alertCount = 0
+			m.droppedAlerts = 0
 		case "h", "?":
 			m.showHelp = !m.showHelp
 		case "down", "j":
@@ -119,7 +167,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case alertMsg:
 		m.alertCount++
 		if m.paused {
-			m.pending = append(m.pending, msg.a)
+			m.queueAlert(msg.a)
 		} else {
 			m.appendAlert(msg.a)
 		}
@@ -131,7 +179,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	s := "🛡️  Go-LogShield Real-time TUI Monitoring Dashboard\n"
-	s += fmt.Sprintf("Alerts Detected: %d | Queued: %d | Paused: %v\n", m.alertCount, len(m.pending), m.paused)
+	s += fmt.Sprintf("Alerts Detected: %d | Queued: %d/%d | Dropped: %d | Paused: %v\n", m.alertCount, len(m.pending), maxPausedAlerts, m.droppedAlerts, m.paused)
 	s += "--------------------------------------------------\n"
 
 	if len(m.alerts) == 0 {

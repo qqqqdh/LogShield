@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type Event struct {
@@ -26,7 +27,10 @@ func ParseLine(line string) (Event, error) {
 		return Event{}, errors.New("empty line")
 	}
 
-	parts := strings.Fields(line)
+	parts, err := splitFields(line)
+	if err != nil {
+		return Event{}, err
+	}
 	if len(parts) < 2 {
 		return Event{}, errors.New("invalid line format")
 	}
@@ -49,7 +53,6 @@ func ParseLine(line string) (Event, error) {
 			continue
 		}
 		k, v := kv[0], kv[1]
-		v = strings.Trim(v, `"`)
 
 		switch k {
 		case "service":
@@ -68,10 +71,69 @@ func ParseLine(line string) (Event, error) {
 		}
 	}
 
-	// 최소 필수: service 없으면 의미가 애매해서 에러 처리
+	// Keep one Event vocabulary across quoted and unquoted project logs.
+	ev.Service = strings.ToLower(ev.Service)
+	ev.Action = strings.ToLower(ev.Action)
 	if ev.Service == "" {
 		return Event{}, errors.New("missing service field")
 	}
+	if ev.Service == "ssh" && ev.Action == "login" {
+		ev.Action = "auth"
+	}
+	if ev.Service == "auth" || ev.Service == "ssh" {
+		switch strings.ToUpper(ev.Status) {
+		case "FAIL", "FAILED", "FAILURE":
+			ev.Status = "FAIL"
+		case "SUCCESS", "SUCCEEDED":
+			ev.Status = "SUCCESS"
+		}
+	}
 
 	return ev, nil
+}
+
+// splitFields keeps quoted values, including spaces, within one key=value token.
+func splitFields(line string) ([]string, error) {
+	fields := make([]string, 0, 8)
+	var field strings.Builder
+	inQuotes := false
+	escaped := false
+
+	flush := func() {
+		if field.Len() == 0 {
+			return
+		}
+		fields = append(fields, field.String())
+		field.Reset()
+	}
+
+	for _, r := range line {
+		if escaped {
+			field.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if inQuotes && r == '\\' {
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+		if unicode.IsSpace(r) && !inQuotes {
+			flush()
+			continue
+		}
+		field.WriteRune(r)
+	}
+
+	if escaped {
+		field.WriteRune('\\')
+	}
+	if inQuotes {
+		return nil, errors.New("unterminated quoted field")
+	}
+	flush()
+	return fields, nil
 }

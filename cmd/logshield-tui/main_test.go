@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -49,5 +50,84 @@ func TestClearDiscardsPausedAlerts(t *testing.T) {
 	m = updated.(model)
 	if len(m.alerts) != 0 || m.alertCount != 0 {
 		t.Fatalf("clear should discard paused alerts: alerts=%d count=%d", len(m.alerts), m.alertCount)
+	}
+}
+
+func TestPausedBufferKeepsImportantAlertsAndResumesByTime(t *testing.T) {
+	m := initialModel(make(chan Alert))
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(model)
+	for _, a := range []Alert{
+		{TS: time.Unix(50, 0), Severity: "치명", Title: "critical"},
+		{TS: time.Unix(300, 0), Severity: "높음", Title: "high"},
+	} {
+		updated, _ = m.Update(alertMsg{a: a})
+		m = updated.(model)
+	}
+	for i := 0; i < 100; i++ {
+		updated, _ = m.Update(alertMsg{a: Alert{
+			TS: time.Unix(int64(100+i), 0), Severity: "낮음", Title: fmt.Sprintf("low-%d", i),
+		}})
+		m = updated.(model)
+	}
+	if len(m.pending) != 100 || m.droppedAlerts != 2 {
+		t.Fatalf("pending = %d, dropped = %d; want 100 and 2", len(m.pending), m.droppedAlerts)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(model)
+	if len(m.alerts) != 100 {
+		t.Fatalf("resumed alerts = %d, want 100", len(m.alerts))
+	}
+	if m.alerts[0].Title != "critical" || m.alerts[len(m.alerts)-1].Title != "high" {
+		t.Fatalf("unexpected order: first=%+v last=%+v", m.alerts[0], m.alerts[len(m.alerts)-1])
+	}
+	for i := 1; i < len(m.alerts); i++ {
+		if m.alerts[i].TS.Before(m.alerts[i-1].TS) {
+			t.Fatalf("alerts are not chronological at %d", i)
+		}
+	}
+	for _, a := range m.alerts {
+		if a.Title == "low-0" || a.Title == "low-1" {
+			t.Fatalf("old low-severity alert survived: %s", a.Title)
+		}
+	}
+}
+
+func TestPausedBufferPrefersRecentWithinSeverity(t *testing.T) {
+	m := initialModel(make(chan Alert))
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(model)
+	for i := 0; i <= 100; i++ {
+		updated, _ = m.Update(alertMsg{a: Alert{
+			TS: time.Unix(int64(i), 0), Severity: "높음", Title: fmt.Sprintf("high-%d", i),
+		}})
+		m = updated.(model)
+	}
+	updated, _ = m.Update(alertMsg{a: Alert{TS: time.Unix(-1, 0), Severity: "높음", Title: "older"}})
+	m = updated.(model)
+	if len(m.pending) != 100 || m.droppedAlerts != 2 {
+		t.Fatalf("pending = %d, dropped = %d; want 100 and 2", len(m.pending), m.droppedAlerts)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(model)
+	if m.alerts[0].Title != "high-1" || m.alerts[len(m.alerts)-1].Title != "high-100" {
+		t.Fatalf("same-severity retention wrong: first=%s last=%s", m.alerts[0].Title, m.alerts[len(m.alerts)-1].Title)
+	}
+}
+
+func TestPausedBufferUsesArrivalOrderForEqualTimestamp(t *testing.T) {
+	m := initialModel(make(chan Alert))
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(model)
+	for i := 0; i <= 100; i++ {
+		updated, _ = m.Update(alertMsg{a: Alert{
+			TS: time.Unix(1, 0), Severity: "높음", Title: fmt.Sprintf("same-%d", i),
+		}})
+		m = updated.(model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(model)
+	if len(m.alerts) != 100 || m.alerts[0].Title != "same-1" || m.alerts[len(m.alerts)-1].Title != "same-100" {
+		t.Fatalf("equal-time retention wrong: count=%d first=%s last=%s", len(m.alerts), m.alerts[0].Title, m.alerts[len(m.alerts)-1].Title)
 	}
 }
