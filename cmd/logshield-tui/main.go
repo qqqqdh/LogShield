@@ -35,15 +35,16 @@ const (
 )
 
 type model struct {
-	alerts       []Alert
-	selectedIdx  int
-	mode         viewMode
-	err          error
-	paused       bool
-	showHelp     bool
-	eventCount   int
-	alertCount   int
-	subChan      chan Alert
+	alerts      []Alert
+	pending     []Alert
+	selectedIdx int
+	mode        viewMode
+	err         error
+	paused      bool
+	showHelp    bool
+	eventCount  int
+	alertCount  int
+	subChan     chan Alert
 }
 
 func initialModel(subChan chan Alert) model {
@@ -66,6 +67,14 @@ func waitForNextAlert(subChan chan Alert) tea.Cmd {
 	}
 }
 
+func (m *model) appendAlert(a Alert) {
+	followLatest := len(m.alerts) == 0 || m.selectedIdx == len(m.alerts)-1
+	m.alerts = append(m.alerts, a)
+	if followLatest {
+		m.selectedIdx = len(m.alerts) - 1
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -74,8 +83,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "p":
 			m.paused = !m.paused
+			if !m.paused {
+				for _, a := range m.pending {
+					m.appendAlert(a)
+				}
+				m.pending = nil
+			}
 		case "c":
 			m.alerts = nil
+			m.pending = nil
 			m.selectedIdx = 0
 			m.alertCount = 0
 		case "h", "?":
@@ -101,12 +117,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case alertMsg:
-		if !m.paused {
-			m.alerts = append(m.alerts, msg.a)
-			m.alertCount++
-			if m.selectedIdx == len(m.alerts)-2 || len(m.alerts) == 1 {
-				m.selectedIdx = len(m.alerts) - 1
-			}
+		m.alertCount++
+		if m.paused {
+			m.pending = append(m.pending, msg.a)
+		} else {
+			m.appendAlert(msg.a)
 		}
 		return m, waitForNextAlert(m.subChan)
 	}
@@ -116,7 +131,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	s := "🛡️  Go-LogShield Real-time TUI Monitoring Dashboard\n"
-	s += fmt.Sprintf("Alerts Detected: %d | Paused: %v\n", len(m.alerts), m.paused)
+	s += fmt.Sprintf("Alerts Detected: %d | Queued: %d | Paused: %v\n", m.alertCount, len(m.pending), m.paused)
 	s += "--------------------------------------------------\n"
 
 	if len(m.alerts) == 0 {
