@@ -1,12 +1,62 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"go-logshield/internal/analyzer"
+	"go-logshield/internal/pkg/alertstore"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+func TestVisibleAlertsStayBounded(t *testing.T) {
+	m := initialModel(make(chan Alert))
+	for i := 0; i < 101; i++ {
+		updated, _ := m.Update(alertMsg{a: Alert{TS: time.Unix(int64(i), 0), Title: fmt.Sprintf("alert-%d", i)}})
+		m = updated.(model)
+	}
+	if len(m.alerts) != 100 || m.alerts[0].Title != "alert-1" {
+		t.Fatalf("visible alerts=%d first=%s, want 100 and alert-1", len(m.alerts), m.alerts[0].Title)
+	}
+}
+
+func TestRealtimeWorkerMergesFilesAndPersistsAlert(t *testing.T) {
+	lines := make(chan rawLine, 5)
+	for i := 0; i < 5; i++ {
+		path := "auth-a.log"
+		if i%2 == 1 {
+			path = "auth-b.log"
+		}
+		lines <- rawLine{path: path, text: fmt.Sprintf("2026-10-28T10:00:%02dZ service=auth action=login user=alice ip=203.0.113.5 status=FAIL", i)}
+	}
+	close(lines)
+	journalPath := filepath.Join(t.TempDir(), "alerts.jsonl")
+	journal, err := alertstore.Open(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	var alerts []Alert
+	runRealtimeWorker(lines, analyzer.NewDefault(), journal, func(a Alert) { alerts = append(alerts, a) }, func(err error) { t.Error(err) })
+	if len(alerts) != 1 {
+		t.Fatalf("alerts=%d, want 1", len(alerts))
+	}
+	data, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry alertstore.Entry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.Alert.RuleID != "BRUTE_FORCE_LOGIN" {
+		t.Fatalf("journal alert=%+v", entry.Alert)
+	}
+}
 
 func TestPausedAlertsAppearOnceInOrderAfterResume(t *testing.T) {
 	m := initialModel(make(chan Alert))

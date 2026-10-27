@@ -7,10 +7,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
-	"go-logshield/internal/detector"
-	"go-logshield/internal/normalizer"
+	"go-logshield/internal/analyzer"
+	"go-logshield/internal/pkg/alertstore"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nxadm/tail"
@@ -28,6 +29,36 @@ type Alert struct {
 }
 
 type alertMsg struct{ a Alert }
+
+type rawLine struct{ path, text string }
+type errMsg struct{ err error }
+
+// The single worker owns detector state for every tailed file.
+func runRealtimeWorker(lines <-chan rawLine, engine *analyzer.Analyzer, journal *alertstore.Journal, emit func(Alert), reportError func(error)) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			engine.Prune(time.Now())
+		case item, ok := <-lines:
+			if !ok {
+				return
+			}
+			_, results, err := engine.ProcessLine(item.text)
+			if err != nil {
+				reportError(fmt.Errorf("parse error (%s): %w", item.path, err))
+				continue
+			}
+			for _, result := range results {
+				if err := journal.Append(result); err != nil {
+					reportError(fmt.Errorf("alert journal: %w", err))
+				}
+				emit(Alert{TS: result.TS, Severity: result.Severity, Title: result.Title, Message: result.Message, IP: result.IP, RuleID: result.RuleID, Service: result.Service})
+			}
+		}
+	}
+}
 
 type viewMode int
 
@@ -72,6 +103,12 @@ func waitForNextAlert(subChan chan Alert) tea.Cmd {
 
 func (m *model) appendAlert(a Alert) {
 	followLatest := len(m.alerts) == 0 || m.selectedIdx == len(m.alerts)-1
+	if len(m.alerts) >= maxPausedAlerts {
+		m.alerts = m.alerts[1:]
+		if m.selectedIdx > 0 {
+			m.selectedIdx--
+		}
+	}
 	m.alerts = append(m.alerts, a)
 	if followLatest {
 		m.selectedIdx = len(m.alerts) - 1
@@ -164,6 +201,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = viewList
 		}
 
+	case errMsg:
+		m.err = msg.err
+		return m, nil
 	case alertMsg:
 		m.alertCount++
 		if m.paused {
@@ -181,6 +221,9 @@ func (m model) View() string {
 	s := "🛡️  Go-LogShield Real-time TUI Monitoring Dashboard\n"
 	s += fmt.Sprintf("Alerts Detected: %d | Queued: %d/%d | Dropped: %d | Paused: %v\n", m.alertCount, len(m.pending), maxPausedAlerts, m.droppedAlerts, m.paused)
 	s += "--------------------------------------------------\n"
+	if m.err != nil {
+		s += fmt.Sprintf("Error: %v\n", m.err)
+	}
 
 	if len(m.alerts) == 0 {
 		s += "Waiting for incoming log stream and security alerts...\n"
@@ -205,47 +248,97 @@ func (m model) View() string {
 
 func main() {
 	logDir := flag.String("log-dir", "./logs", "Directory containing log files to tail")
+	alertPath := flag.String("alerts-file", "alerts.jsonl", "Append-only JSONL alert journal")
 	flag.Parse()
 
+	pattern := filepath.Join(*logDir, "*.log")
+	files, err := filepath.Glob(pattern)
+	if err != nil || len(files) == 0 {
+		fmt.Fprintf(os.Stderr, "no log files found for %s: %v\n", pattern, err)
+		os.Exit(1)
+	}
+	journal, err := alertstore.Open(*alertPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open alert journal: %v\n", err)
+		os.Exit(1)
+	}
+
+	tailers := make([]*tail.Tail, 0, len(files))
+	tailerPaths := make([]string, 0, len(files))
+	for _, path := range files {
+		t, err := tail.TailFile(path, tail.Config{Follow: true, ReOpen: true, Poll: true, Logger: tail.DiscardingLogger})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tail %s: %v\n", path, err)
+			continue
+		}
+		tailers = append(tailers, t)
+		tailerPaths = append(tailerPaths, path)
+	}
+	if len(tailers) == 0 {
+		_ = journal.Close()
+		fmt.Fprintln(os.Stderr, "no readable log files")
+		os.Exit(1)
+	}
+
 	subChan := make(chan Alert, 100)
-
-	// Tail log files in background
+	p := tea.NewProgram(initialModel(subChan))
+	lines := make(chan rawLine, 1024)
+	uiDone := make(chan struct{})
+	var producers sync.WaitGroup
+	workerDone := make(chan struct{})
 	go func() {
-		pattern := filepath.Join(*logDir, "*.log")
-		files, _ := filepath.Glob(pattern)
-
-		bruteForce := detector.NewBruteForceDetector(detector.BruteForceConfig{Window: 20 * time.Second, Threshold: 5})
-		sshBruteForce := detector.NewSSHBruteForceDetector(30*time.Second, 6)
-		webEnum := detector.NewWebEnumDetector(30*time.Second, 4)
-
-		for _, file := range files {
-			go func(filePath string) {
-				t, err := tail.TailFile(filePath, tail.Config{Follow: true, ReOpen: true})
-				if err != nil {
+		defer close(workerDone)
+		runRealtimeWorker(lines, analyzer.NewDefault(), journal,
+			func(a Alert) {
+				select {
+				case subChan <- a:
+				case <-uiDone:
+				}
+			},
+			func(err error) {
+				fmt.Fprintln(os.Stderr, err)
+				p.Send(errMsg{err: err})
+			})
+	}()
+	for i, t := range tailers {
+		path := tailerPaths[i]
+		producers.Add(1)
+		go func() {
+			defer producers.Done()
+			for line := range t.Lines {
+				if line == nil {
+					continue
+				}
+				raw := strings.TrimSpace(line.Text)
+				if raw == "" {
+					continue
+				}
+				select {
+				case lines <- rawLine{path: path, text: raw}:
+				case <-uiDone:
 					return
 				}
-				for line := range t.Lines {
-					ev, err := normalizer.ParseLine(line.Text)
-					if err != nil {
-						continue
-					}
-					if r, ok := bruteForce.Process(ev); ok {
-						subChan <- Alert{TS: ev.TS, Severity: r.Severity, Title: r.Title, Message: r.Message, IP: r.IP, RuleID: r.RuleID, Service: r.Service}
-					}
-					if r, ok := sshBruteForce.Process(ev); ok {
-						subChan <- Alert{TS: ev.TS, Severity: r.Severity, Title: r.Title, Message: r.Message, IP: r.IP, RuleID: r.RuleID, Service: r.Service}
-					}
-					if r, ok := webEnum.Process(ev); ok {
-						subChan <- Alert{TS: ev.TS, Severity: r.Severity, Title: r.Title, Message: r.Message, IP: r.IP, RuleID: r.RuleID, Service: r.Service}
-					}
-				}
-			}(file)
-		}
-	}()
+			}
+		}()
+	}
 
-	p := tea.NewProgram(initialModel(subChan))
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error running TUI: %v\n", err)
+	_, runErr := p.Run()
+	close(uiDone)
+	for _, t := range tailers {
+		_ = t.Stop()
+		t.Cleanup()
+	}
+	producers.Wait()
+	close(lines)
+	<-workerDone
+	closeErr := journal.Close()
+	if closeErr != nil {
+		fmt.Fprintf(os.Stderr, "close alert journal: %v\n", closeErr)
+	}
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "Error running TUI: %v\n", runErr)
+	}
+	if closeErr != nil || runErr != nil {
 		os.Exit(1)
 	}
 }

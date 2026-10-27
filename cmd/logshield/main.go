@@ -9,21 +9,78 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"go-logshield/internal/detector"
 	"go-logshield/internal/detector/llm"
 	"go-logshield/internal/normalizer"
+	"go-logshield/internal/pkg/alertstore"
 	"go-logshield/internal/pkg/watcher"
 )
 
 type FinalReport struct {
-	Timestamp         string            `json:"timestamp"`
-	RuleBasedAlerts   []detector.Result `json:"rule_based_alerts"`
-	LLMICLEvaluations []llm.ICLResult   `json:"llm_icl_evaluations"`
-	TotalLogsAnalyzed int               `json:"total_logs_analyzed"`
-	ActiveSessions    int               `json:"active_sessions_count"`
+	Timestamp             string            `json:"timestamp"`
+	RuleBasedAlerts       []detector.Result `json:"rule_based_alerts"`
+	LLMICLEvaluations     []llm.ICLResult   `json:"llm_icl_evaluations"`
+	TotalLogsAnalyzed     int               `json:"total_logs_analyzed"`
+	TotalLogsRead         int               `json:"total_logs_read"`
+	ParseErrors           int               `json:"parse_errors"`
+	ActiveSessions        int               `json:"active_sessions_count"`
+	RuleAlertsOmitted     int               `json:"rule_alerts_omitted_from_report"`
+	LLMEvaluationsOmitted int               `json:"llm_evaluations_omitted_from_report"`
+	WatchFailures         int               `json:"watch_failures"`
+}
+
+const maxReportEntries = 100
+
+func appendRuleReport(report *FinalReport, alert detector.Result) {
+	if len(report.RuleBasedAlerts) < maxReportEntries {
+		report.RuleBasedAlerts = append(report.RuleBasedAlerts, alert)
+		return
+	}
+	copy(report.RuleBasedAlerts, report.RuleBasedAlerts[1:])
+	report.RuleBasedAlerts[len(report.RuleBasedAlerts)-1] = alert
+	report.RuleAlertsOmitted++
+}
+
+func appendLLMReport(report *FinalReport, evaluation llm.ICLResult) {
+	if len(report.LLMICLEvaluations) < maxReportEntries {
+		report.LLMICLEvaluations = append(report.LLMICLEvaluations, evaluation)
+		return
+	}
+	copy(report.LLMICLEvaluations, report.LLMICLEvaluations[1:])
+	report.LLMICLEvaluations[len(report.LLMICLEvaluations)-1] = evaluation
+	report.LLMEvaluationsOmitted++
+}
+
+// processWatchStream drains queued lines after tailers stop, including on Ctrl+C.
+func processWatchStream(logs <-chan string, workerDone <-chan struct{}, stop chan struct{}, signals <-chan os.Signal, process func(string)) {
+	stopping := false
+	for {
+		select {
+		case line := <-logs:
+			process(line)
+		case <-signals:
+			if !stopping {
+				close(stop)
+				stopping = true
+			}
+		case <-workerDone:
+			if !stopping {
+				close(stop)
+			}
+			for {
+				select {
+				case line := <-logs:
+					process(line)
+				default:
+					return
+				}
+			}
+		}
+	}
 }
 
 func main() {
@@ -38,6 +95,7 @@ func main() {
 	printPrompt := flag.Bool("print-prompt", false, "Print the full generated LLM prompt to stdout for verification")
 	watchMode := flag.Bool("watch", false, "Enable real-time log file tailing mode")
 	reportFile := flag.String("report", "report.json", "Output JSON report file path")
+	alertsFile := flag.String("alerts-file", "alerts.jsonl", "Append-only JSONL file for every detected alert")
 	flag.Parse()
 
 	// 1. Locate log files
@@ -48,6 +106,11 @@ func main() {
 	}
 	if len(files) == 0 {
 		log.Fatalf("No log files found in %s", *logDir)
+	}
+
+	journal, err := alertstore.Open(*alertsFile)
+	if err != nil {
+		log.Fatalf("open alert journal: %v", err)
 	}
 
 	// 2. Initialize Rule-Based Detectors
@@ -66,7 +129,7 @@ func main() {
 	if *enableLLM {
 		sessionManager = llm.NewSessionContextManager(llm.SessionContextManagerConfig{
 			IdleTTL:             *idleTTL,
-			HardTTL:              *hardTTL,
+			HardTTL:             *hardTTL,
 			MaxSessions:         *maxSessions,
 			MaxEventsPerSession: 20,
 		})
@@ -91,31 +154,42 @@ func main() {
 	}
 
 	totalLogs := 0
+	totalLogsRead := 0
+	parseErrors := 0
 	promptCount := 0
+	recordRuleAlert := func(r detector.Result) {
+		if err := journal.Append(r); err != nil {
+			log.Fatalf("write alert journal: %v", err)
+		}
+		fmt.Printf("⚠️  [RULE DETECTED] %s\n", r.Message)
+		appendRuleReport(&report, r)
+	}
 
 	processLogLine := func(line string) {
-		totalLogs++
+		totalLogsRead++
 		ev, err := normalizer.ParseLine(line)
 		if err != nil {
+			parseErrors++
+			if parseErrors <= 10 {
+				log.Printf("unsupported or malformed log line %d: %v", totalLogsRead, err)
+			}
 			return
 		}
+		totalLogs++
 
 		ruleTriggered := false
 
 		// A) Rule-Based Detection
 		if r, ok := bruteForceDetector.Process(ev); ok {
-			fmt.Printf("⚠️  [RULE DETECTED] %s\n", r.Message)
-			report.RuleBasedAlerts = append(report.RuleBasedAlerts, r)
+			recordRuleAlert(r)
 			ruleTriggered = true
 		}
 		if r, ok := sshBruteForceDetector.Process(ev); ok {
-			fmt.Printf("⚠️  [RULE DETECTED] %s\n", r.Message)
-			report.RuleBasedAlerts = append(report.RuleBasedAlerts, r)
+			recordRuleAlert(r)
 			ruleTriggered = true
 		}
 		if r, ok := webEnumDetector.Process(ev); ok {
-			fmt.Printf("⚠️  [RULE DETECTED] %s\n", r.Message)
-			report.RuleBasedAlerts = append(report.RuleBasedAlerts, r)
+			recordRuleAlert(r)
 			ruleTriggered = true
 		}
 
@@ -146,7 +220,7 @@ func main() {
 
 				iclResult, err := iclDetector.EvaluateContextWithInput(promptInput)
 				if err == nil {
-					report.LLMICLEvaluations = append(report.LLMICLEvaluations, iclResult)
+					appendLLMReport(&report, iclResult)
 
 					if iclResult.Result.IsAttack {
 						techID := "TXXXX"
@@ -160,6 +234,14 @@ func main() {
 
 						// Check Stage 2 Alert Cooldown
 						if anomalyEvaluator.ShouldAlert(session.CorrelationKey(), techID, severity, ev.TS) {
+							reasoning := ""
+							if len(iclResult.Result.Findings) > 0 {
+								reasoning = iclResult.Result.Findings[0].Reasoning
+							}
+							llmAlert := detector.Result{TS: ev.TS, RuleID: "LLM_" + string(iclResult.Engine) + "_" + techID, Title: techSummary, Severity: severity, Message: fmt.Sprintf("%s (engine=%s, confidence=%.2f, score=%d/32)", reasoning, iclResult.Engine, iclResult.Result.Confidence, stats.TotalScore), IP: session.IP, Service: session.Service}
+							if err := journal.Append(llmAlert); err != nil {
+								log.Fatalf("write LLM alert journal: %v", err)
+							}
 							fmt.Printf("\n🤖 [LLM ICL ALERT] Key: %s | Engine: %s (Status: %s) | Anomaly Score: %d/32\n", session.CorrelationKey(), iclResult.Engine, iclResult.EvaluationStatus, stats.TotalScore)
 							fmt.Printf("   🎯 Technique: %s | Severity: %s\n", techSummary, severity)
 							if len(iclResult.Result.Findings) > 0 {
@@ -175,30 +257,33 @@ func main() {
 		}
 	}
 
+	watchFailures := 0
 	if *watchMode {
 		fmt.Printf("📡 [Real-Time Watcher] Tailing %d log files in real-time (Press Ctrl+C to stop)...\n", len(files))
 		logChan := make(chan string, 1000)
 		stopChan := make(chan struct{})
-
+		watchErrors := make(chan error, len(files))
+		workerDone := make(chan struct{})
+		var workers sync.WaitGroup
 		for _, file := range files {
-			f := file
+			path := file
+			workers.Add(1)
 			go func() {
-				_ = watcher.TailFile(f, logChan, stopChan)
+				defer workers.Done()
+				if err := watcher.TailFile(path, logChan, stopChan); err != nil {
+					watchErrors <- fmt.Errorf("tail %s: %w", path, err)
+				}
 			}()
 		}
-
+		go func() { workers.Wait(); close(workerDone) }()
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-		for {
-			select {
-			case line := <-logChan:
-				processLogLine(line)
-			case <-sigChan:
-				fmt.Println("\n🛑 Stopping real-time watcher...")
-				close(stopChan)
-				goto FINALIZE
-			}
+		processWatchStream(logChan, workerDone, stopChan, sigChan, processLogLine)
+		signal.Stop(sigChan)
+		close(watchErrors)
+		for err := range watchErrors {
+			watchFailures++
+			log.Print(err)
 		}
 	} else {
 		// Batch processing mode
@@ -209,14 +294,23 @@ func main() {
 				log.Fatal(err)
 			}
 			scanner := bufio.NewScanner(fp)
+			scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 			for scanner.Scan() {
 				processLogLine(scanner.Text())
 			}
-			_ = fp.Close()
+			if err := scanner.Err(); err != nil {
+				_ = fp.Close()
+				log.Fatalf("scan %s: %v", file, err)
+			}
+			if err := fp.Close(); err != nil {
+				log.Fatalf("close %s: %v", file, err)
+			}
 		}
 	}
 
-FINALIZE:
+	report.WatchFailures = watchFailures
+	report.TotalLogsRead = totalLogsRead
+	report.ParseErrors = parseErrors
 	report.TotalLogsAnalyzed = totalLogs
 	if sessionManager != nil {
 		report.ActiveSessions = sessionManager.ActiveSessionsCount()
@@ -224,8 +318,20 @@ FINALIZE:
 
 	// Save JSON report
 	reportData, err := json.MarshalIndent(report, "", "  ")
-	if err == nil {
-		_ = os.WriteFile(*reportFile, reportData, 0644)
-		fmt.Printf("\n📊 Analysis complete. Total logs analyzed: %d. Report saved to %s\n", totalLogs, *reportFile)
+	if err != nil {
+		log.Fatalf("marshal report: %v", err)
+	}
+	if err := os.WriteFile(*reportFile, reportData, 0600); err != nil {
+		log.Fatalf("write report: %v", err)
+	}
+	if err := journal.Close(); err != nil {
+		log.Fatalf("close alert journal: %v", err)
+	}
+	fmt.Printf("\n📊 Analysis complete. Parsed: %d/%d lines; parse errors: %d. Report saved to %s\n", totalLogs, totalLogsRead, parseErrors, *reportFile)
+	if totalLogsRead > 0 && totalLogs == 0 {
+		log.Fatal("no supported log lines were parsed")
+	}
+	if watchFailures > 0 {
+		log.Fatalf("%d log watcher(s) failed", watchFailures)
 	}
 }
