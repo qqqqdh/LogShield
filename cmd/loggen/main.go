@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,8 +40,9 @@ type model struct {
 	statusLine string
 
 	// 통계(있으면 보기 좋음)
-	totalEvents int
-	totalAlerts int
+	totalEvents   int
+	totalAlerts   int
+	droppedAlerts int
 }
 
 func initialModel() model {
@@ -100,11 +102,43 @@ func (m *model) appendAlert(a Alert) {
 	m.selected = clamp(m.selected, 0, len(m.alerts)-1)
 }
 
-func (m *model) queueAlert(a Alert) {
-	if len(m.pending) >= maxStoredAlerts {
-		m.pending = m.pending[1:]
+func severityRank(severity string) int {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "치명", "critical":
+		return 4
+	case "높음", "high":
+		return 3
+	case "중간", "medium":
+		return 2
+	case "낮음", "low":
+		return 1
+	default:
+		return 0
 	}
-	m.pending = append(m.pending, a)
+}
+
+// Keep the most severe alerts. Within one severity, retain newer event times;
+// equal timestamps prefer the alert received later.
+func (m *model) queueAlert(a Alert) {
+	if len(m.pending) < maxStoredAlerts {
+		m.pending = append(m.pending, a)
+		return
+	}
+	worst := 0
+	for i := 1; i < len(m.pending); i++ {
+		candidate, current := m.pending[i], m.pending[worst]
+		if severityRank(candidate.Severity) < severityRank(current.Severity) ||
+			(severityRank(candidate.Severity) == severityRank(current.Severity) && candidate.TS.Before(current.TS)) {
+			worst = i
+		}
+	}
+	current := m.pending[worst]
+	if severityRank(a.Severity) > severityRank(current.Severity) ||
+		(severityRank(a.Severity) == severityRank(current.Severity) && !a.TS.Before(current.TS)) {
+		copy(m.pending[worst:], m.pending[worst+1:])
+		m.pending[len(m.pending)-1] = a
+	}
+	m.droppedAlerts++
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -126,6 +160,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.paused {
 				m.statusLine = "⏸ 일시정지됨 (p로 재개) — 경고는 잠깐 멈춤"
 			} else {
+				sort.SliceStable(m.pending, func(i, j int) bool {
+					return m.pending[i].TS.Before(m.pending[j].TS)
+				})
 				for _, alert := range m.pending {
 					m.appendAlert(alert)
 				}
@@ -141,16 +178,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = viewList
 			m.totalEvents = 0
 			m.totalAlerts = 0
+			m.droppedAlerts = 0
 			m.statusLine = "🧹 초기화 완료"
 			return m, nil
 
 		case "s":
-			if len(m.alerts) == 0 {
+			if len(m.alerts)+len(m.pending) == 0 {
 				m.statusLine = "저장할 경고가 없습니다."
 				return m, nil
 			}
+			reportAlerts := make([]Alert, 0, len(m.alerts)+len(m.pending))
+			reportAlerts = append(reportAlerts, m.alerts...)
+			reportAlerts = append(reportAlerts, m.pending...)
+			sort.SliceStable(reportAlerts, func(i, j int) bool {
+				return reportAlerts[i].TS.Before(reportAlerts[j].TS)
+			})
 			m.statusLine = "💾 report.json 저장 중..."
-			return m, saveReportCmd(m.alerts)
+			return m, saveReportCmd(reportAlerts)
 
 		case "esc":
 			if m.mode == viewDetail {
@@ -229,8 +273,8 @@ func (m model) View() string {
 
 	header := ""
 	header += "Go-LogShield TUI (실시간 로그 분석)\n"
-	header += fmt.Sprintf("상태: %s | 이벤트: %d | 경고: %d | 모드: %s\n",
-		state, m.totalEvents, m.totalAlerts,
+	header += fmt.Sprintf("상태: %s | 이벤트: %d | 경고: %d | 대기: %d/%d | 버림: %d | 모드: %s\n",
+		state, m.totalEvents, m.totalAlerts, len(m.pending), maxStoredAlerts, m.droppedAlerts,
 		map[viewMode]string{viewList: "LIST", viewDetail: "DETAIL"}[m.mode],
 	)
 	if m.statusLine != "" {

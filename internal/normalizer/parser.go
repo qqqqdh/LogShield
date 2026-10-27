@@ -53,6 +53,7 @@ func ParseLine(line string) (Event, error) {
 			continue
 		}
 		k, v := kv[0], kv[1]
+
 		switch k {
 		case "service":
 			ev.Service = v
@@ -70,17 +71,28 @@ func ParseLine(line string) (Event, error) {
 		}
 	}
 
-	// 최소 필수: service 없으면 의미가 애매해서 에러 처리
+	// Keep one Event vocabulary across quoted and unquoted project logs.
+	ev.Service = strings.ToLower(ev.Service)
+	ev.Action = strings.ToLower(ev.Action)
 	if ev.Service == "" {
 		return Event{}, errors.New("missing service field")
+	}
+	if ev.Service == "ssh" && ev.Action == "login" {
+		ev.Action = "auth"
+	}
+	if ev.Service == "auth" || ev.Service == "ssh" {
+		switch strings.ToUpper(ev.Status) {
+		case "FAIL", "FAILED", "FAILURE":
+			ev.Status = "FAIL"
+		case "SUCCESS", "SUCCEEDED":
+			ev.Status = "SUCCESS"
+		}
 	}
 
 	return ev, nil
 }
 
-// splitFields is like strings.Fields but keeps quoted values together. Log
-// fields such as ua="scan bot/1.0" and path="/admin panel" must remain one
-// key=value token for the normalizer to consume them correctly.
+// splitFields keeps quoted values, including spaces, within one key=value token.
 func splitFields(line string) ([]string, error) {
 	fields := make([]string, 0, 8)
 	var field strings.Builder
