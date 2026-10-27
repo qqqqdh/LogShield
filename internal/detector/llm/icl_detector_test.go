@@ -178,6 +178,32 @@ func TestEvaluateContext_SchemaErrorInvalid(t *testing.T) {
 	}
 }
 
+func TestNetworkFallbackRecognizesNormalizedFailStatus(t *testing.T) {
+	client := &mockInferenceClient{errors: []error{errors.New("connection refused")}}
+	detector := NewICLDetectorWithClient(ICLDetectorConfig{ModelName: "mock-model", Timeout: time.Second}, client)
+	context := "(1) service=auth action=login status=FAIL ip=203.0.113.5\n(2) service=auth action=login status=FAIL ip=203.0.113.5\n(3) service=auth action=login status=FAIL ip=203.0.113.5"
+	result, err := detector.EvaluateContext(context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Result.IsAttack || result.Engine != EngineFallbackRule {
+		t.Fatalf("normalized failure context was missed: %+v", result)
+	}
+}
+
+func TestNetworkFallbackDoesNotTreatWeb401AsLoginFailures(t *testing.T) {
+	client := &mockInferenceClient{errors: []error{errors.New("connection refused")}}
+	detector := NewICLDetectorWithClient(ICLDetectorConfig{ModelName: "mock-model", Timeout: time.Second}, client)
+	context := "(1) service=web action=get status=401 path=/index\n(2) service=web action=get status=401 path=/index\n(3) service=web action=get status=401 path=/index"
+	result, err := detector.EvaluateContext(context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Result.IsAttack {
+		t.Fatalf("web 401 became authentication attack: %+v", result.Result)
+	}
+}
+
 func TestEvaluateContext_NetworkFailureFallback(t *testing.T) {
 	mockClient := &mockInferenceClient{
 		errors: []error{

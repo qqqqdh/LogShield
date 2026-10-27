@@ -30,6 +30,7 @@ type MetricResult struct {
 	FPR              float64               `json:"false_positive_rate"`
 	AvgLatencyMs     float64               `json:"avg_latency_ms"`
 	LLMCallCount     int                   `json:"llm_call_count"`
+	LLMValidCount    int                   `json:"llm_valid_count"`
 	DegradedRatio    float64               `json:"degraded_ratio"`
 	InvalidRatio     float64               `json:"invalid_ratio"`
 	TechniqueMetrics map[string]TechMetric `json:"technique_metrics,omitempty"`
@@ -37,13 +38,13 @@ type MetricResult struct {
 
 // PredictionDetail holds details for a single sample evaluation in a benchmark run.
 type PredictionDetail struct {
-	SampleID       string
-	IsAttack       bool
-	TechniqueID    string
-	IsDegraded     bool
-	IsInvalid      bool
-	Latency        time.Duration
-	ExecutedLLM    bool
+	SampleID    string
+	IsAttack    bool
+	TechniqueID string
+	IsDegraded  bool
+	IsInvalid   bool
+	Latency     time.Duration
+	ExecutedLLM bool
 }
 
 // Sample holds a behavior context test case with its ground truth label.
@@ -56,6 +57,10 @@ type Sample struct {
 }
 
 type MultiModeBenchmarkReport struct {
+	ModelName      string       `json:"model_name"`
+	DatasetSource  string       `json:"dataset_source"`
+	DatasetKind    string       `json:"dataset_kind"`
+	ReferenceTime  string       `json:"reference_time"`
 	Timestamp      string       `json:"timestamp"`
 	RuleOnly       MetricResult `json:"rule_only"`
 	FallbackOnly   MetricResult `json:"fallback_only"`
@@ -72,6 +77,7 @@ func NewEvaluator() *Evaluator {
 func (e *Evaluator) ComputeDetailed(modeName string, predictions []PredictionDetail, dataset []Sample) MetricResult {
 	tp, fp, tn, fn := 0, 0, 0, 0
 	llmCalls := 0
+	llmValid := 0
 	degradedCount := 0
 	invalidCount := 0
 	var totalLatency time.Duration
@@ -86,6 +92,9 @@ func (e *Evaluator) ComputeDetailed(modeName string, predictions []PredictionDet
 		totalLatency += p.Latency
 		if p.ExecutedLLM {
 			llmCalls++
+			if !p.IsDegraded && !p.IsInvalid {
+				llmValid++
+			}
 		}
 		if p.IsDegraded {
 			degradedCount++
@@ -199,6 +208,7 @@ func (e *Evaluator) ComputeDetailed(modeName string, predictions []PredictionDet
 		FPR:              roundFloat(fpr, 4),
 		AvgLatencyMs:     roundFloat(avgLatMs, 2),
 		LLMCallCount:     llmCalls,
+		LLMValidCount:    llmValid,
 		DegradedRatio:    roundFloat(degradedRatio, 4),
 		InvalidRatio:     roundFloat(invalidRatio, 4),
 		TechniqueMetrics: finalTechMetrics,
@@ -226,18 +236,21 @@ func roundFloat(val float64, precision int) float64 {
 
 func (r MultiModeBenchmarkReport) PrintComparisonSummary() {
 	fmt.Println("\n📊 ==================== LOGSHIELD 4-MODE BENCHMARK EVALUATION ====================")
-	fmt.Printf("%-18s | %-8s | %-8s | %-8s | %-8s | %-10s | %-10s\n", "Mode", "Accuracy", "Precision", "Recall", "F1-Score", "LLM Calls", "Avg Latency")
+	fmt.Printf("%-22s | %-8s | %-8s | %-8s | %-8s | %-11s | %-10s\n", "Mode", "Accuracy", "Precision", "Recall", "F1-Score", "LLM valid/try", "Avg Latency")
 	fmt.Println("--------------------------------------------------------------------------------------------------")
 	printModeRow(r.RuleOnly)
 	printModeRow(r.FallbackOnly)
 	printModeRow(r.LLMOnly)
 	printModeRow(r.HybridPipeline)
+	if r.LLMOnly.LLMValidCount == 0 {
+		fmt.Println("No valid LLM responses: model accuracy was not measured; fallback/rule results are shown.")
+	}
 	fmt.Println("================================================================================------------------")
 }
 
 func printModeRow(m MetricResult) {
-	fmt.Printf("%-18s | %-8.4f | %-8.4f | %-8.4f | %-8.4f | %-10d | %-8.2fms\n",
-		m.ModeName, m.Accuracy, m.Precision, m.Recall, m.F1Score, m.LLMCallCount, m.AvgLatencyMs)
+	fmt.Printf("%-22s | %-8.4f | %-8.4f | %-8.4f | %-8.4f | %-11s | %-8.2fms\n",
+		m.ModeName, m.Accuracy, m.Precision, m.Recall, m.F1Score, fmt.Sprintf("%d/%d", m.LLMValidCount, m.LLMCallCount), m.AvgLatencyMs)
 }
 
 func (m MetricResult) PrintSummary() {
@@ -249,7 +262,7 @@ func (m MetricResult) PrintSummary() {
 	fmt.Printf("Recall                   : %.4f (%.2f%%)\n", m.Recall, m.Recall*100)
 	fmt.Printf("F1-Score                 : %.4f (%.2f%%)\n", m.F1Score, m.F1Score*100)
 	fmt.Printf("False Positive Rate (FPR): %.4f (%.2f%%)\n", m.FPR, m.FPR*100)
-	fmt.Printf("LLM Call Count           : %d\n", m.LLMCallCount)
+	fmt.Printf("LLM Valid / Attempted    : %d / %d\n", m.LLMValidCount, m.LLMCallCount)
 	fmt.Printf("Average Latency          : %.2f ms\n", m.AvgLatencyMs)
 	fmt.Printf("Degraded / Invalid Ratio : Degraded=%.2f%%, Invalid=%.2f%%\n", m.DegradedRatio*100, m.InvalidRatio*100)
 	fmt.Println("=====================================================================================")

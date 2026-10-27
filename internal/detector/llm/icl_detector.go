@@ -33,7 +33,7 @@ const (
 type Finding struct {
 	TechniqueID      string `json:"technique_id"`
 	AttackName       string `json:"attack_name"`
-	Severity         string `json:"severity"`          // low, medium, high, critical
+	Severity         string `json:"severity"`           // low, medium, high, critical
 	EvidenceEventIDs []int  `json:"evidence_event_ids"` // minimal 1 item when attack
 	Reasoning        string `json:"reasoning"`
 }
@@ -326,14 +326,35 @@ func cleanJSONResponse(respText string) string {
 	return strings.TrimSpace(respText)
 }
 
+// Count signals by service so HTTP 401 responses do not become login failures.
+func fallbackSignalCounts(contextText string) (failed, scans int) {
+	for _, line := range strings.Split(strings.ToLower(contextText), "\n") {
+		var service, status, path string
+		for _, field := range strings.Fields(line) {
+			field = strings.Trim(field, ",;")
+			switch {
+			case strings.HasPrefix(field, "service="):
+				service = strings.TrimPrefix(field, "service=")
+			case strings.HasPrefix(field, "status="):
+				status = strings.TrimPrefix(field, "status=")
+			case strings.HasPrefix(field, "path="):
+				path = strings.TrimPrefix(field, "path=")
+			}
+		}
+		if (service == "auth" || service == "ssh") && (status == "fail" || status == "failed" || status == "failure" || status == "401") {
+			failed++
+		}
+		if service == "web" && (status == "404" || strings.HasPrefix(path, "/.env") || strings.HasPrefix(path, "/admin")) {
+			scans++
+		}
+	}
+	return failed, scans
+}
+
 // Fallback heuristic evaluator for degraded execution when LLM is unavailable.
 func (d *ICLDetector) fallbackEvaluate(behaviorContext string, cause error, status EvaluationStatus) (ICLResult, error) {
-	ctxLower := strings.ToLower(behaviorContext)
-
 	resPayload := LLMResponsePayload{}
-
-	failedCount := strings.Count(ctxLower, "status=failed") + strings.Count(ctxLower, "status=401")
-	notfoundCount := strings.Count(ctxLower, "status=404") + strings.Count(ctxLower, "path=/.env") + strings.Count(ctxLower, "path=/admin")
+	failedCount, notfoundCount := fallbackSignalCounts(behaviorContext)
 
 	if failedCount >= 3 {
 		resPayload.IsAttack = true
