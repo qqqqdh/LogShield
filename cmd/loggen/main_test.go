@@ -4,11 +4,56 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"go-logshield/internal/analyzer"
+	"go-logshield/internal/pkg/alertstore"
+
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+func TestRealtimeWorkerSharesDetectorStateAcrossFiles(t *testing.T) {
+	lines := make(chan rawLine, 5)
+	for i := 0; i < 5; i++ {
+		path := "auth-a.log"
+		if i%2 == 1 {
+			path = "auth-b.log"
+		}
+		lines <- rawLine{path: path, text: fmt.Sprintf("2026-10-28T10:00:%02dZ service=auth action=login user=alice ip=203.0.113.5 status=FAIL", i)}
+	}
+	close(lines)
+	journalPath := filepath.Join(t.TempDir(), "alerts.jsonl")
+	journal, err := alertstore.Open(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	var alerts, events int
+	runRealtimeWorker(lines, make(chan struct{}), analyzer.NewDefault(), journal, func(msg tea.Msg) {
+		switch m := msg.(type) {
+		case alertMsg:
+			alerts++
+		case eventCountMsg:
+			events += m.n
+		}
+	})
+	if events != 5 || alerts != 1 {
+		t.Fatalf("events=%d alerts=%d, want 5 and 1", events, alerts)
+	}
+	data, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry alertstore.Entry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.Alert.RuleID != "BRUTE_FORCE_LOGIN" {
+		t.Fatalf("journal alert = %+v", entry.Alert)
+	}
+}
 
 func TestPausedAlertsAreShownAfterResume(t *testing.T) {
 	m := initialModel()

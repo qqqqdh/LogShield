@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go-logshield/internal/analyzer"
 	"go-logshield/internal/detector"
+	"go-logshield/internal/pkg/alertstore"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nxadm/tail"
@@ -338,9 +340,45 @@ func (m model) View() string {
 	return out
 }
 
+type rawLine struct {
+	path string
+	text string
+}
+
+// One worker owns the analyzer, so events from different files cannot
+// interleave detector state updates.
+func runRealtimeWorker(lines <-chan rawLine, stop <-chan struct{}, engine *analyzer.Analyzer, journal *alertstore.Journal, emit func(tea.Msg)) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			engine.Prune(time.Now())
+		case item, ok := <-lines:
+			if !ok {
+				return
+			}
+			emit(eventCountMsg{n: 1})
+			_, results, err := engine.ProcessLine(item.text)
+			if err != nil {
+				emit(errMsg{err: fmt.Errorf("parse error (%s): %w", item.path, err)})
+				continue
+			}
+			for _, result := range results {
+				if err := journal.Append(result); err != nil {
+					emit(errMsg{err: fmt.Errorf("alert journal: %w", err)})
+				}
+				emit(alertMsg{a: result})
+			}
+		}
+	}
+}
+
 // --- 실시간 tail + 분석 파이프라인 ---
 // stopFn()을 호출하면 모든 tailer goroutine이 정리됩니다.
-func startRealtimePipeline(p *tea.Program, logDir string) (stopFn func(), err error) {
+func startRealtimePipeline(p *tea.Program, logDir, alertPath string) (stopFn func(), err error) {
 	pattern := filepath.Join(logDir, "*.log")
 	paths, err := filepath.Glob(pattern)
 	if err != nil {
@@ -351,7 +389,19 @@ func startRealtimePipeline(p *tea.Program, logDir string) (stopFn func(), err er
 		return func() {}, nil
 	}
 
+	journal, err := alertstore.Open(alertPath)
+	if err != nil {
+		return func() {}, fmt.Errorf("open alert journal: %w", err)
+	}
 	engine := analyzer.NewDefault()
+	lines := make(chan rawLine, 1024)
+	stopWorker := make(chan struct{})
+	var producers sync.WaitGroup
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		runRealtimeWorker(lines, stopWorker, engine, journal, p.Send)
+	}()
 
 	tailers := make([]*tail.Tail, 0, len(paths))
 
@@ -370,7 +420,9 @@ func startRealtimePipeline(p *tea.Program, logDir string) (stopFn func(), err er
 		}
 		tailers = append(tailers, t)
 
+		producers.Add(1)
 		go func() {
+			defer producers.Done()
 			for line := range t.Lines {
 				if line == nil {
 					continue
@@ -379,17 +431,10 @@ func startRealtimePipeline(p *tea.Program, logDir string) (stopFn func(), err er
 				if raw == "" {
 					continue
 				}
-
-				p.Send(eventCountMsg{n: 1})
-
-				_, results, err := engine.ProcessLine(raw)
-				if err != nil {
-					p.Send(errMsg{err: fmt.Errorf("parse error (%s): %v", path, err)})
-					continue
-				}
-
-				for _, result := range results {
-					p.Send(alertMsg{a: result})
+				select {
+				case lines <- rawLine{path: path, text: raw}:
+				case <-stopWorker:
+					return
 				}
 			}
 		}()
@@ -397,24 +442,31 @@ func startRealtimePipeline(p *tea.Program, logDir string) (stopFn func(), err er
 
 	p.Send(statusMsg{text: fmt.Sprintf("실시간 tail 시작: %d개 파일 (%s)", len(tailers), pattern)})
 
-	// 모든 tailer를 정리하는 함수 반환
+	// Stop producers, then drain the bounded queue.
 	return func() {
 		for _, t := range tailers {
 			_ = t.Stop()
 			t.Cleanup()
+		}
+		producers.Wait()
+		close(lines)
+		<-workerDone
+		if err := journal.Close(); err != nil {
+			p.Send(errMsg{err: fmt.Errorf("close alert journal: %w", err)})
 		}
 	}, nil
 }
 
 func main() {
 	logDir := flag.String("log-dir", "./logs", "분석할 로그 파일이 위치한 디렉터리")
+	alertPath := flag.String("alerts-file", "alerts.jsonl", "모든 탐지 경고를 누적 저장할 JSONL 파일")
 	flag.Parse()
 
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 
 	pipelineReady := make(chan func(), 1)
 	go func() {
-		stop, err := startRealtimePipeline(p, *logDir)
+		stop, err := startRealtimePipeline(p, *logDir, *alertPath)
 		if err != nil {
 			p.Send(errMsg{err: err})
 			stop = func() {}
