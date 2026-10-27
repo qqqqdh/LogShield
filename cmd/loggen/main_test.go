@@ -14,6 +14,26 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+func TestRealtimeWorkerSkipsFlyPlatformRecords(t *testing.T) {
+	lines := make(chan rawLine, 1)
+	lines <- rawLine{path: "fly.log", text: `{"timestamp":"2026-10-28T10:00:00Z","message":"INFO Starting init"}`}
+	close(lines)
+	journal, err := alertstore.Open(filepath.Join(t.TempDir(), "alerts.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	errors := 0
+	runRealtimeWorker(lines, make(chan struct{}), analyzer.NewDefault(), journal, func(msg tea.Msg) {
+		if _, ok := msg.(errMsg); ok {
+			errors++
+		}
+	})
+	if errors != 0 {
+		t.Fatalf("platform records produced %d parse errors", errors)
+	}
+}
+
 func TestRealtimeWorkerSharesDetectorStateAcrossFiles(t *testing.T) {
 	lines := make(chan rawLine, 5)
 	for i := 0; i < 5; i++ {

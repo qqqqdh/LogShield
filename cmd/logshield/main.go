@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 
 	"go-logshield/internal/analyzer"
+	"go-logshield/internal/normalizer"
 )
 
 func main() {
@@ -50,6 +52,9 @@ func processFile(path string, engine *analyzer.Analyzer) error {
 	for scanner.Scan() {
 		line := scanner.Text()
 		ev, results, err := engine.ProcessLine(line)
+		if errors.Is(err, normalizer.ErrNonEvent) {
+			continue
+		}
 		if err != nil {
 			fmt.Println("PARSE_ERR:", err, "line:", line)
 			continue

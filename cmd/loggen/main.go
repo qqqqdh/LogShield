@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"go-logshield/internal/analyzer"
 	"go-logshield/internal/detector"
+	"go-logshield/internal/normalizer"
 	"go-logshield/internal/pkg/alertstore"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -362,6 +364,9 @@ func runRealtimeWorker(lines <-chan rawLine, stop <-chan struct{}, engine *analy
 			}
 			emit(eventCountMsg{n: 1})
 			_, results, err := engine.ProcessLine(item.text)
+			if errors.Is(err, normalizer.ErrNonEvent) {
+				continue
+			}
 			if err != nil {
 				emit(errMsg{err: fmt.Errorf("parse error (%s): %w", item.path, err)})
 				continue
