@@ -21,7 +21,7 @@ go run ./cmd/loggen -out ./sample-logs -count 100
 go run ./cmd/logshield -log-dir ./sample-logs -llm=false -report report.json -alerts-file alerts.jsonl
 
 # 규칙 + LLM: 기본 LLM 활성화, -print-prompt로 생성 문맥 확인 가능
-go run ./cmd/logshield -log-dir ./sample-logs -ollama-url http://localhost:11434 -llm-model llama3.1:8b
+go run ./cmd/logshield -log-dir ./sample-logs -ollama-url http://localhost:11434 -llm-model llama3.1:8b -llm-timeout 120s
 
 # 실시간 CLI: Ctrl+C로 종료 후 보고서 저장
 go run ./cmd/logshield -log-dir ./logs -watch -report report.json -alerts-file alerts.jsonl
@@ -33,16 +33,16 @@ go run ./cmd/logshield-tui -log-dir ./logs -alerts-file alerts.jsonl
 go run ./cmd/logaudit -input ./logs/fly.jsonl -output audit.json
 
 # 독립적으로 정답을 붙인 데이터셋으로 평가
-go run ./cmd/benchmark -dataset labeled.json -output benchmark_report.json
+go run ./cmd/benchmark -dataset labeled.json -output benchmark_report.json -llm-timeout 120s
 ```
 
 기존에 발견한 파일을 tail하며 새 파일 자동 발견은 지원하지 않습니다. 배치 CLI는 전체 파일을 읽어 이벤트 시간순으로 합친 후 분석하므로 메모리가 입력 크기에 비례합니다. 실시간 탐지기는 제한된 상태를 유지하며 입력 시각 전후 한 시간창의 역순 도착을 결합합니다. 서로 먼 과거 구간의 임의 혼합을 완전히 복원하지는 않습니다.
 
 ## 분석과 저장의 의미
 
-공통 파서는 프로젝트 key=value 로그, OpenSSH 인증 syslog, combined access, 지원되는 Fly JSON HTTP 요청 메시지를 처리합니다. 지원하지 않는 플랫폼 메시지와 잘못된 입력은 각각 비이벤트와 파싱 오류로 집계합니다. 입력에 없는 IP를 만들어내지 않으며 IP 누락 이벤트는 LLM 세션에도 넣지 않습니다.
+공통 파서는 프로젝트 key=value 로그, OpenSSH 인증 syslog, combined access, 지원되는 Fly JSON HTTP 요청 메시지를 처리합니다. 지원하지 않는 플랫폼 메시지와 잘못된 입력은 각각 비이벤트와 파싱 오류로 집계합니다. IP 표기는 공통 검증 단계에서 통일하고, 잘못된 IP나 HTTP 상태값(100~599 밖)은 오류로 기록합니다. 인증 결과를 알 수 없으면 `UNKNOWN`으로 보존합니다. 배치 오류는 원본 파일과 행번호를 포함합니다. 입력에 없는 IP를 만들어내지 않으며 IP 누락 이벤트는 LLM 세션에도 넣지 않습니다.
 
-기본 규칙은 동일 IP의 auth/login 실패 5회/20초, SSH 실패 6회/30초, 민감한 웹 경로의 HTTP 401·403·404 응답 4회/30초입니다. CLI는 이상 점수가 임계치에 도달한 세션을 LLM으로 평가합니다. 네트워크 실패 시 규칙 폴백을 구분해 반환합니다. 필수 JSON 필드가 없거나 null인 응답은 재시도 후에도 잘못되어 있으면 invalid/schema_error이며 정상 응답이 아닙니다.
+기본 규칙은 동일 IP의 auth/login 실패 5회/20초, SSH 실패 6회/30초, 민감한 웹 경로의 HTTP 401·403·404 응답 4회/30초입니다. CLI는 이상 점수가 임계치에 도달한 세션을 LLM으로 평가합니다. 네트워크 실패 시 규칙 폴백을 구분해 반환합니다. Ollama에 JSON 스키마와 temperature=0을 전달하고 한 번만 평가합니다. 필수 필드 누락/null·알 수 없는 필드·중복 키·지원하지 않는 기법·범위 밖 또는 중복 근거 번호는 검증 실패입니다. 형식 오류 뒤 자동 재판정은 하지 않습니다. 실패는 `invalid` 또는 `fallback_rule` 엔진 및 `parse_error`/`schema_error`/`timeout`/`unavailable` 상태로 표시하며 규칙 경고는 유지합니다. 잘못된 모델 응답은 `raw_response`에 보관합니다. `-llm-timeout`은 기본 120초이며 양수여야 합니다. 긴 동기식 LLM 호출 동안 실시간 로그 소비는 지연될 수 있습니다.
 
 CLI의 `report.json`은 종료할 때 덮어쓰는 요약 객체입니다. 주요 필드는 다음과 같습니다.
 
@@ -61,4 +61,4 @@ TUI의 `p`는 화면 반영만 일시정지합니다. 임시 경고 최대 100�
 
 제공된 skueat 로그 수집본은 HTTP 클라이언트 IP와 정답 라벨이 없어 파싱 검증에만 사용했습니다. 운영 탐지 성능 평가는 클라이언트 식별 정보와 인증 결과를 포함한 비식별 로그 및 독립 라벨이 필요합니다.
 
-데이터셋 형식은 [신뢰성 명세](docs/reliability-spec.md), 수집본 검증은 [Fly 로그 검증](docs/fly-log-validation.md), 역순 처리와 회귀 조건은 [수정 명세](docs/review-fixes-spec.md)를 참고하세요.
+데이터셋 형식은 [신뢰성 명세](docs/reliability-spec.md), 수집본 검증은 [Fly 로그 검증](docs/fly-log-validation.md), 최신 파서·검증기 계약은 [파서 검증 명세](docs/parser-validation-spec.md), 이전 역순 처리 조건은 [수정 명세](docs/review-fixes-spec.md)를 참고하세요.

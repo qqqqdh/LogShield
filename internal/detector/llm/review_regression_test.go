@@ -40,7 +40,7 @@ func TestRequiredJSONFields(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if r.Engine != EngineInvalid || r.EvaluationStatus != StatusSchemaError || r.AttemptCount != 2 || client.callCount != 2 {
+			if r.Engine != EngineInvalid || r.EvaluationStatus != StatusSchemaError || r.AttemptCount != 1 || client.callCount != 1 {
 				t.Fatalf("invalid response accepted: %+v calls=%d", r, client.callCount)
 			}
 		})
@@ -48,8 +48,8 @@ func TestRequiredJSONFields(t *testing.T) {
 	valid := `{"is_attack":false,"confidence":0,"findings":[]}`
 	client := &mockInferenceClient{responses: []string{"{}", valid}}
 	r, err := NewICLDetectorWithClient(ICLDetectorConfig{Timeout: time.Second}, client).EvaluateContext("test")
-	if err != nil || r.Engine != EngineLLM || r.AttemptCount != 2 {
-		t.Fatalf("retry failed: %+v err=%v", r, err)
+	if err != nil || r.Engine != EngineInvalid || r.AttemptCount != 1 {
+		t.Fatalf("invalid response must not be reclassified: %+v err=%v", r, err)
 	}
 }
 

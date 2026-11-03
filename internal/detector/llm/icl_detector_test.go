@@ -37,7 +37,7 @@ func TestEvaluateContext_ValidAttack(t *testing.T) {
 		Timeout:   5 * time.Second,
 	}, mockClient)
 
-	res, err := detector.EvaluateContext("sample context")
+	res, err := detector.EvaluateContextWithInput(PromptInput{BehaviorContext: "sample context", TotalEvents: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestEvaluateContext_ValidNormal(t *testing.T) {
 		Timeout:   5 * time.Second,
 	}, mockClient)
 
-	res, err := detector.EvaluateContext("sample context")
+	res, err := detector.EvaluateContextWithInput(PromptInput{BehaviorContext: "sample context", TotalEvents: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -87,11 +87,11 @@ func TestEvaluateContext_ValidNormal(t *testing.T) {
 	}
 }
 
-func TestEvaluateContext_ParseErrorRetrySuccess(t *testing.T) {
+func TestEvaluateContext_ParseErrorDoesNotRetry(t *testing.T) {
 	mockClient := &mockInferenceClient{
 		responses: []string{
 			`This is not JSON but text explaining attack true`, // Fail 1
-			`{"is_attack": true, "confidence": 0.88, "findings": [{"technique_id": "T1110", "attack_name": "Brute Force", "severity": "high", "evidence_event_ids": [1], "reasoning": "Valid JSON retry"}], "recommended_action": "Block"}`, // Retry success
+			`{"is_attack": true, "confidence": 0.88, "findings": [{"technique_id": "T1110", "attack_name": "Brute Force", "severity": "high", "evidence_event_ids": [1], "reasoning": "Valid JSON retry"}], "recommended_action": "Block"}`, // Must not be requested
 		},
 	}
 
@@ -100,19 +100,22 @@ func TestEvaluateContext_ParseErrorRetrySuccess(t *testing.T) {
 		Timeout:   5 * time.Second,
 	}, mockClient)
 
-	res, err := detector.EvaluateContext("sample context")
+	res, err := detector.EvaluateContextWithInput(PromptInput{BehaviorContext: "sample context", TotalEvents: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if res.Engine != EngineLLM {
-		t.Errorf("expected engine %s, got %s", EngineLLM, res.Engine)
+	if res.Engine != EngineInvalid {
+		t.Errorf("expected invalid after one call, got %s", res.Engine)
 	}
-	if res.AttemptCount != 2 {
-		t.Errorf("expected AttemptCount=2, got %d", res.AttemptCount)
+	if mockClient.callCount != 1 {
+		t.Errorf("unexpected second inference: %d", mockClient.callCount)
 	}
-	if res.EvaluationStatus != StatusValid {
-		t.Errorf("expected StatusValid, got %s", res.EvaluationStatus)
+	if res.AttemptCount != 1 {
+		t.Errorf("expected AttemptCount=1, got %d", res.AttemptCount)
+	}
+	if res.EvaluationStatus != StatusParseError {
+		t.Errorf("expected StatusParseError, got %s", res.EvaluationStatus)
 	}
 }
 
@@ -129,7 +132,7 @@ func TestEvaluateContext_ParseErrorFinalInvalid(t *testing.T) {
 		Timeout:   5 * time.Second,
 	}, mockClient)
 
-	res, err := detector.EvaluateContext("sample context")
+	res, err := detector.EvaluateContextWithInput(PromptInput{BehaviorContext: "sample context", TotalEvents: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -143,8 +146,8 @@ func TestEvaluateContext_ParseErrorFinalInvalid(t *testing.T) {
 	if !res.DegradedMode {
 		t.Errorf("expected DegradedMode=true for invalid result")
 	}
-	if res.AttemptCount != 2 {
-		t.Errorf("expected AttemptCount=2, got %d", res.AttemptCount)
+	if res.AttemptCount != 1 {
+		t.Errorf("expected AttemptCount=1, got %d", res.AttemptCount)
 	}
 	// Verify that string contains "attack" did NOT force IsAttack=true!
 	if res.Result.IsAttack {
@@ -165,7 +168,7 @@ func TestEvaluateContext_SchemaErrorInvalid(t *testing.T) {
 		Timeout:   5 * time.Second,
 	}, mockClient)
 
-	res, err := detector.EvaluateContext("sample context")
+	res, err := detector.EvaluateContextWithInput(PromptInput{BehaviorContext: "sample context", TotalEvents: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -228,8 +231,8 @@ func TestEvaluateContext_NetworkFailureFallback(t *testing.T) {
 	if !res.DegradedMode {
 		t.Errorf("expected DegradedMode=true on fallback")
 	}
-	if res.EvaluationStatus != StatusValid {
-		t.Errorf("expected StatusValid for successful fallback execution, got %s", res.EvaluationStatus)
+	if res.EvaluationStatus != StatusUnavailable {
+		t.Errorf("expected StatusUnavailable for network failure, got %s", res.EvaluationStatus)
 	}
 	if !res.Result.IsAttack {
 		t.Errorf("expected fallback rule to detect attack for 3 failed logins")

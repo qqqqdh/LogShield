@@ -90,6 +90,7 @@ func main() {
 	enableLLM := flag.Bool("llm", true, "Enable LLaMA 3.1 8B In-Context Learning (ICL) Detector")
 	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "Ollama API Endpoint URL")
 	llmModel := flag.String("llm-model", "llama3.1:8b", "LLM Model Name for In-Context Learning")
+	llmTimeout := flag.Duration("llm-timeout", 120*time.Second, "Maximum time per LLM evaluation")
 	anomalyThreshold := flag.Int("anomaly-threshold", 7, "Anomaly Score threshold (0-32) to trigger 2nd-stage LLM evaluation")
 	idleTTL := flag.Duration("session-idle-ttl", 10*time.Minute, "Session Idle TTL before expiration")
 	hardTTL := flag.Duration("session-hard-ttl", 30*time.Minute, "Session Hard TTL before Epoch Rollover")
@@ -99,6 +100,9 @@ func main() {
 	reportFile := flag.String("report", "report.json", "Output JSON report file path")
 	alertsFile := flag.String("alerts-file", "alerts.jsonl", "Append-only JSONL file for every detected alert")
 	flag.Parse()
+	if *llmTimeout <= 0 {
+		log.Fatal("llm-timeout must be positive")
+	}
 
 	// 1. Locate log files
 	pattern := filepath.Join(*logDir, "*.log")
@@ -143,7 +147,7 @@ func main() {
 		iclDetector = llm.NewICLDetector(llm.ICLDetectorConfig{
 			OllamaURL: *ollamaURL,
 			ModelName: *llmModel,
-			Timeout:   5 * time.Second,
+			Timeout:   *llmTimeout,
 		})
 		fmt.Printf("🤖 [LogShield Phase 3 & 4] Hybrid LLM Engine Initialized (Model: %s, Anomaly Threshold: %d/32)\n", *llmModel, *anomalyThreshold)
 		fmt.Printf("   ⚙️ Session Key: IP|Service, Idle TTL: %v, Hard TTL: %v, Max Sessions: %d\n\n", *idleTTL, *hardTTL, *maxSessions)
@@ -233,6 +237,9 @@ func main() {
 				iclResult, err := iclDetector.EvaluateContextWithInput(promptInput)
 				if err == nil {
 					appendLLMReport(&report, iclResult)
+					if iclResult.Engine == llm.EngineInvalid || iclResult.EvaluationStatus != llm.StatusValid {
+						fmt.Printf("⚠️ [LLM EVALUATION FAILED] Engine: %s | Status: %s | Detail: %s\n", iclResult.Engine, iclResult.EvaluationStatus, iclResult.ParseError)
+					}
 
 					if iclResult.Result.IsAttack {
 						techID := "TXXXX"
@@ -261,7 +268,7 @@ func main() {
 							}
 							fmt.Printf("   ⚙️  Model: %s (Fingerprint: %s)\n\n", iclResult.ModelUsed, fingerprint)
 						}
-					} else {
+					} else if iclResult.Engine == llm.EngineLLM && iclResult.EvaluationStatus == llm.StatusValid {
 						fmt.Printf("🟢 [LLM ICL NORMAL] Key: %s | Engine: %s | Anomaly Score: %d/32\n", session.CorrelationKey(), iclResult.Engine, stats.TotalScore)
 					}
 				}

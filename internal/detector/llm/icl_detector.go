@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Engine string
@@ -34,7 +36,7 @@ type Finding struct {
 	TechniqueID      string `json:"technique_id"`
 	AttackName       string `json:"attack_name"`
 	Severity         string `json:"severity"`           // low, medium, high, critical
-	EvidenceEventIDs []int  `json:"evidence_event_ids"` // minimal 1 item when attack
+	EvidenceEventIDs []int  `json:"evidence_event_ids"` // unique indices 1..TotalEvents when attack
 	Reasoning        string `json:"reasoning"`
 }
 
@@ -52,6 +54,7 @@ type ICLResult struct {
 	AttemptCount     int                `json:"attempt_count"`
 	ModelUsed        string             `json:"model_used,omitempty"`
 	ParseError       string             `json:"parse_error,omitempty"`
+	RawResponse      string             `json:"raw_response,omitempty"`
 	Prompt           string             `json:"prompt_used,omitempty"`
 	Result           LLMResponsePayload `json:"result"`
 }
@@ -90,10 +93,33 @@ func NewOllamaClient(config OllamaClientConfig) *OllamaClient {
 	}
 }
 
+var responseSchema = json.RawMessage(`{
+ "type":"object","additionalProperties":false,
+ "required":["is_attack","confidence","findings"],
+ "properties":{
+  "is_attack":{"type":"boolean"},
+  "confidence":{"type":"number","minimum":0,"maximum":1},
+  "findings":{"type":"array","maxItems":20,"items":{
+   "type":"object","additionalProperties":false,
+   "required":["technique_id","attack_name","severity","evidence_event_ids","reasoning"],
+   "properties":{
+    "technique_id":{"type":"string","enum":["T1110","T1595","T1078","T1499","T1059"]},
+    "attack_name":{"type":"string","minLength":1,"maxLength":128},
+    "severity":{"type":"string","enum":["low","medium","high","critical"]},
+    "evidence_event_ids":{"type":"array","minItems":1,"uniqueItems":true,"items":{"type":"integer","minimum":1}},
+    "reasoning":{"type":"string","minLength":1,"maxLength":1024}
+   }
+  }},
+  "recommended_action":{"type":"string","maxLength":256}
+ }
+}`)
+
 type ollamaRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+	Model   string             `json:"model"`
+	Prompt  string             `json:"prompt"`
+	Stream  bool               `json:"stream"`
+	Format  json.RawMessage    `json:"format"`
+	Options map[string]float64 `json:"options"`
 }
 
 type ollamaResponse struct {
@@ -103,9 +129,11 @@ type ollamaResponse struct {
 
 func (c *OllamaClient) Generate(ctx context.Context, prompt string) (string, error) {
 	reqBody := ollamaRequest{
-		Model:  c.config.ModelName,
-		Prompt: prompt,
-		Stream: false,
+		Model:   c.config.ModelName,
+		Prompt:  prompt,
+		Stream:  false,
+		Format:  responseSchema,
+		Options: map[string]float64{"temperature": 0},
 	}
 
 	data, err := json.Marshal(reqBody)
@@ -130,11 +158,21 @@ func (c *OllamaClient) Generate(ctx context.Context, prompt string) (string, err
 		return "", fmt.Errorf("ollama API status %d", resp.StatusCode)
 	}
 
+	data, err = io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > 1<<20 {
+		return "", errors.New("Ollama response exceeds 1 MiB")
+	}
 	var ollamaResp ollamaResponse
-	if err := json.NewDecoder(resp.Body).Decode(&ollamaResp); err != nil {
+	if err := json.Unmarshal(data, &ollamaResp); err != nil {
 		return "", fmt.Errorf("decode response error: %w", err)
 	}
 
+	if !ollamaResp.Done {
+		return "", errors.New("Ollama generation is incomplete")
+	}
 	return ollamaResp.Response, nil
 }
 
@@ -174,7 +212,7 @@ func NewICLDetectorWithClient(config ICLDetectorConfig, client InferenceClient) 
 	}
 }
 
-// EvaluateContext evaluates a behavior context with strict parsing, 1-step retry, and envelope wrapping.
+// EvaluateContext is a legacy text-only path; attack evidence needs TotalEvents via EvaluateContextWithInput.
 func (d *ICLDetector) EvaluateContext(behaviorContext string) (ICLResult, error) {
 	return d.EvaluateContextWithInput(PromptInput{
 		BehaviorContext: behaviorContext,
@@ -186,11 +224,8 @@ func (d *ICLDetector) EvaluateContextWithInput(input PromptInput) (ICLResult, er
 	prompt := d.generator.GeneratePromptWithInput(input)
 	ctx, cancel := context.WithTimeout(context.Background(), d.config.Timeout)
 	defer cancel()
-
-	// Attempt 1: Primary LLM generation
-	rawResp, err := d.client.Generate(ctx, prompt)
+	raw, err := d.client.Generate(ctx, prompt)
 	if err != nil {
-		// Differentiate timeout vs unavailable
 		status := StatusUnavailable
 		var netErr net.Error
 		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
@@ -198,144 +233,146 @@ func (d *ICLDetector) EvaluateContextWithInput(input PromptInput) (ICLResult, er
 		}
 		return d.fallbackEvaluate(input.BehaviorContext, err, status)
 	}
-
-	payload, parseErr, schemaErr := d.parseAndValidate(rawResp)
-	if parseErr == nil && schemaErr == nil {
-		return ICLResult{
-			Engine:           EngineLLM,
-			DegradedMode:     false,
-			EvaluationStatus: StatusValid,
-			AttemptCount:     1,
-			ModelUsed:        d.config.ModelName,
-			Prompt:           prompt,
-			Result:           payload,
-		}, nil
-	}
-
-	// Attempt 2: 1-step retry with strict JSON reminder prompt
-	retryPrompt := prompt + "\n\nCRITICAL REMINDER: Your previous response failed validation. Respond ONLY in strict raw JSON without markdown formatting or code blocks."
-	rawResp2, err2 := d.client.Generate(ctx, retryPrompt)
-	if err2 == nil {
-		payload2, parseErr2, schemaErr2 := d.parseAndValidate(rawResp2)
-		if parseErr2 == nil && schemaErr2 == nil {
-			return ICLResult{
-				Engine:           EngineLLM,
-				DegradedMode:     false,
-				EvaluationStatus: StatusValid,
-				AttemptCount:     2,
-				ModelUsed:        d.config.ModelName,
-				Prompt:           retryPrompt,
-				Result:           payload2,
-			}, nil
+	payload, parseErr, schemaErr := d.parseAndValidate(raw, input.TotalEvents)
+	result := ICLResult{Engine: EngineLLM, EvaluationStatus: StatusValid, AttemptCount: 1, ModelUsed: d.config.ModelName, Prompt: prompt, Result: payload}
+	if parseErr != nil || schemaErr != nil {
+		result.Engine = EngineInvalid
+		result.DegradedMode = true
+		result.EvaluationStatus = StatusParseError
+		if schemaErr != nil {
+			result.EvaluationStatus = StatusSchemaError
+			parseErr = schemaErr
 		}
-		if schemaErr2 != nil {
-			schemaErr = schemaErr2
-		} else if parseErr2 != nil {
-			parseErr = parseErr2
-		}
+		result.ParseError = parseErr.Error()
+		result.RawResponse = raw
+		result.Result = LLMResponsePayload{Findings: []Finding{}, RecommendedAction: "evaluation failed"}
 	}
-
-	// Final failure: return invalid envelope without substring matching
-	evalStatus := StatusParseError
-	errReason := ""
-	if parseErr != nil {
-		errReason = parseErr.Error()
-	}
-	if schemaErr != nil {
-		evalStatus = StatusSchemaError
-		errReason = schemaErr.Error()
-	}
-
-	return ICLResult{
-		Engine:           EngineInvalid,
-		DegradedMode:     true,
-		EvaluationStatus: evalStatus,
-		AttemptCount:     2,
-		ModelUsed:        d.config.ModelName,
-		ParseError:       errReason,
-		Prompt:           prompt,
-		Result: LLMResponsePayload{
-			IsAttack:          false,
-			Confidence:        0.0,
-			Findings:          []Finding{},
-			RecommendedAction: "invalid response",
-		},
-	}, nil
+	return result, nil
 }
 
-func (d *ICLDetector) parseAndValidate(respText string) (LLMResponsePayload, error, error) {
-	rawJSON := cleanJSONResponse(respText)
+func (d *ICLDetector) parseAndValidate(raw string, eventCount int) (LLMResponsePayload, error, error) {
 	var payload LLMResponsePayload
-	if err := json.Unmarshal([]byte(rawJSON), &payload); err != nil {
-		return payload, fmt.Errorf("JSON parse error: %w (raw response: %s)", err, truncateString(respText, 100)), nil
+	if !json.Valid([]byte(raw)) {
+		return payload, errors.New("response is not a single valid JSON value"), nil
 	}
-
+	if err := rejectDuplicateKeys(raw); err != nil {
+		return payload, nil, err
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return payload, nil, fmt.Errorf("schema validation error: %w", err)
+	}
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(rawJSON), &fields); err != nil {
-		return payload, err, nil
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		return payload, nil, err
 	}
 	for _, key := range []string{"is_attack", "confidence", "findings"} {
 		value, exists := fields[key]
 		if !exists || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return payload, nil, fmt.Errorf("schema validation error: %s is required and must not be null", key)
+			return payload, nil, fmt.Errorf("%s is required and must not be null", key)
 		}
 	}
-	if err := validatePayload(payload); err != nil {
-		return payload, nil, fmt.Errorf("schema validation error: %w", err)
+	if value, exists := fields["recommended_action"]; exists && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return payload, nil, errors.New("recommended_action must be a string when present")
 	}
-
+	if err := validatePayload(payload, eventCount); err != nil {
+		return payload, nil, err
+	}
 	return payload, nil, nil
 }
 
-func validatePayload(p LLMResponsePayload) error {
-	if p.Confidence < 0.0 || p.Confidence > 1.0 {
-		return fmt.Errorf("confidence %.2f out of range [0.0, 1.0]", p.Confidence)
+// JSON object duplicates are ambiguous even when encoding/json accepts them.
+func rejectDuplicateKeys(raw string) error {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	var visit func() error
+	visit = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delim, ok := token.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delim {
+		case '{':
+			seen := make(map[string]bool)
+			for decoder.More() {
+				key, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				name := key.(string)
+				if name != strings.ToLower(name) {
+					return fmt.Errorf("noncanonical JSON field %q", name)
+				}
+				if seen[name] {
+					return fmt.Errorf("duplicate JSON field %q", name)
+				}
+				seen[name] = true
+				if err := visit(); err != nil {
+					return err
+				}
+			}
+		case '[':
+			for decoder.More() {
+				if err := visit(); err != nil {
+					return err
+				}
+			}
+		}
+		_, err = decoder.Token()
+		return err
 	}
+	return visit()
+}
 
-	if p.IsAttack {
-		if len(p.Findings) == 0 {
-			return errors.New("is_attack=true requires at least 1 finding")
-		}
-		for i, f := range p.Findings {
-			sev := strings.ToLower(f.Severity)
-			if sev != "low" && sev != "medium" && sev != "high" && sev != "critical" {
-				return fmt.Errorf("finding [%d] invalid severity '%s'", i, f.Severity)
-			}
-			if len(f.EvidenceEventIDs) == 0 {
-				return fmt.Errorf("finding [%d] (%s) missing evidence_event_ids", i, f.TechniqueID)
-			}
-		}
-	} else {
+func validatePayload(p LLMResponsePayload, eventCount int) error {
+	if p.Confidence < 0 || p.Confidence > 1 {
+		return errors.New("confidence outside [0,1]")
+	}
+	if utf8.RuneCountInString(p.RecommendedAction) > 256 {
+		return errors.New("recommended_action too long")
+	}
+	if !p.IsAttack {
 		if len(p.Findings) > 0 {
-			return errors.New("is_attack=false requires findings to be an empty array []")
+			return errors.New("is_attack=false requires empty findings")
+		}
+		return nil
+	}
+	if len(p.Findings) == 0 || len(p.Findings) > 20 {
+		return errors.New("attack requires 1..20 findings")
+	}
+	if eventCount <= 0 {
+		return errors.New("attack evidence requires the input event count")
+	}
+	for _, f := range p.Findings {
+		switch f.TechniqueID {
+		case "T1110", "T1595", "T1078", "T1499", "T1059":
+		default:
+			return fmt.Errorf("unsupported technique %q", f.TechniqueID)
+		}
+		switch f.Severity {
+		case "low", "medium", "high", "critical":
+		default:
+			return fmt.Errorf("invalid severity %q", f.Severity)
+		}
+		if strings.TrimSpace(f.AttackName) == "" || utf8.RuneCountInString(f.AttackName) > 128 || strings.TrimSpace(f.Reasoning) == "" || utf8.RuneCountInString(f.Reasoning) > 1024 {
+			return errors.New("finding requires bounded attack_name and reasoning")
+		}
+		if len(f.EvidenceEventIDs) == 0 {
+			return errors.New("finding requires evidence")
+		}
+		seen := make(map[int]bool)
+		for _, id := range f.EvidenceEventIDs {
+			if id < 1 || id > eventCount || seen[id] {
+				return fmt.Errorf("invalid or duplicate evidence ID %d for %d input events", id, eventCount)
+			}
+			seen[id] = true
 		}
 	}
-
 	return nil
-}
-
-func truncateString(s string, maxLen int) string {
-	if len(s) > maxLen {
-		return s[:maxLen] + "..."
-	}
-	return s
-}
-
-func cleanJSONResponse(respText string) string {
-	respText = strings.TrimSpace(respText)
-	if strings.HasPrefix(respText, "```") {
-		lines := strings.Split(respText, "\n")
-		if len(lines) >= 2 {
-			if strings.HasPrefix(lines[0], "```") {
-				lines = lines[1:]
-			}
-			if len(lines) > 0 && strings.HasPrefix(lines[len(lines)-1], "```") {
-				lines = lines[:len(lines)-1]
-			}
-			respText = strings.Join(lines, "\n")
-		}
-	}
-	return strings.TrimSpace(respText)
 }
 
 // Count signals by service so HTTP 401 responses do not become login failures.
@@ -404,8 +441,9 @@ func (d *ICLDetector) fallbackEvaluate(behaviorContext string, cause error, stat
 	return ICLResult{
 		Engine:           EngineFallbackRule,
 		DegradedMode:     true,
-		EvaluationStatus: StatusValid,
+		EvaluationStatus: status,
 		AttemptCount:     1,
+		ParseError:       cause.Error(),
 		ModelUsed:        fmt.Sprintf("%s (ICL Fallback Engine: %v)", d.config.ModelName, cause),
 		Result:           resPayload,
 	}, nil

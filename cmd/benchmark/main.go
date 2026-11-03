@@ -21,7 +21,11 @@ func main() {
 	llmModel := flag.String("llm-model", "llama3.1:8b", "LLM Model Name for Evaluation")
 	reportPath := flag.String("output", "benchmark_report.json", "Output JSON report path")
 	datasetPath := flag.String("dataset", "", "Labeled JSON dataset; empty uses seven synthetic examples")
+	llmTimeout := flag.Duration("llm-timeout", 120*time.Second, "Maximum time per LLM evaluation")
 	flag.Parse()
+	if *llmTimeout <= 0 {
+		log.Fatal("llm-timeout must be positive")
+	}
 
 	fmt.Printf("🚀 [LogShield Benchmark] Running 4-Mode Independent Evaluation (Model: %s)...\n", *llmModel)
 
@@ -40,7 +44,7 @@ func main() {
 	detector := llm.NewICLDetector(llm.ICLDetectorConfig{
 		OllamaURL: *ollamaURL,
 		ModelName: *llmModel,
-		Timeout:   5 * time.Second,
+		Timeout:   *llmTimeout,
 	})
 
 	// 1. Mode 1: Rule-Only Baseline
@@ -50,12 +54,12 @@ func main() {
 
 	// 2. Mode 2: Fallback-Only Heuristic Baseline
 	fmt.Println("🔍 [Mode 2/4] Running Fallback-Only Heuristic Evaluation...")
-	fallbackDetails := evaluateFallbackOnly(dataset)
+	fallbackDetails := evaluateFallbackOnly(dataset, reference)
 	fallbackResult := evaluator.ComputeDetailed("Fallback-Only Baseline", fallbackDetails, dataset)
 
 	// 3. Mode 3: LLM-Only Pure Evaluation (Without Anomaly Pre-filter)
 	fmt.Println("🔍 [Mode 3/4] Running LLM attempts with fallback on model failure...")
-	llmDetails := evaluateLLMOnly(dataset, detector)
+	llmDetails := evaluateLLMOnly(dataset, detector, reference)
 	llmResult := evaluator.ComputeDetailed("LLM Attempt/Fallback", llmDetails, dataset)
 
 	// 4. Mode 4: Rule alerts plus anomaly-score-gated LLM evaluation.
@@ -138,12 +142,13 @@ func (offlineClient) Generate(context.Context, string) (string, error) {
 	return "", errors.New("intentional offline baseline")
 }
 
-func evaluateFallbackOnly(dataset []benchmark.Sample) []benchmark.PredictionDetail {
+func evaluateFallbackOnly(dataset []benchmark.Sample, reference time.Time) []benchmark.PredictionDetail {
 	detector := llm.NewICLDetectorWithClient(llm.ICLDetectorConfig{ModelName: "offline-baseline", Timeout: time.Second}, offlineClient{})
 	details := make([]benchmark.PredictionDetail, len(dataset))
 	for i, sample := range dataset {
 		start := time.Now()
-		result, err := detector.EvaluateContext(sample.BehaviorContext)
+		_, _, events := evaluateRules(sample, reference)
+		result, err := detector.EvaluateContextWithInput(benchmarkPromptInput(events))
 		if err != nil {
 			log.Printf("fallback sample %s: %v", sample.ID, err)
 		}
@@ -156,11 +161,12 @@ func evaluateFallbackOnly(dataset []benchmark.Sample) []benchmark.PredictionDeta
 	return details
 }
 
-func evaluateLLMOnly(dataset []benchmark.Sample, detector *llm.ICLDetector) []benchmark.PredictionDetail {
+func evaluateLLMOnly(dataset []benchmark.Sample, detector *llm.ICLDetector, reference time.Time) []benchmark.PredictionDetail {
 	details := make([]benchmark.PredictionDetail, len(dataset))
 	for i, sample := range dataset {
 		start := time.Now()
-		result, err := detector.EvaluateContext(sample.BehaviorContext)
+		_, _, events := evaluateRules(sample, reference)
+		result, err := detector.EvaluateContextWithInput(benchmarkPromptInput(events))
 		lat := time.Since(start)
 
 		if err != nil {
@@ -195,7 +201,7 @@ func evaluateHybridPipeline(dataset []benchmark.Sample, detector *llm.ICLDetecto
 		executedLLM, isDegraded, isInvalid := false, false, false
 		if ruleAttack || stats.TotalScore >= 7 {
 			executedLLM = true
-			result, err := detector.EvaluateContext(sample.BehaviorContext)
+			result, err := detector.EvaluateContextWithInput(benchmarkPromptInput(events))
 			if err != nil {
 				log.Printf("hybrid sample %s: %v", sample.ID, err)
 			} else {
@@ -212,6 +218,14 @@ func evaluateHybridPipeline(dataset []benchmark.Sample, detector *llm.ICLDetecto
 		details[i] = benchmark.PredictionDetail{SampleID: sample.ID, IsAttack: isAttack, TechniqueID: techID, IsDegraded: isDegraded, IsInvalid: isInvalid, Latency: time.Since(start), ExecutedLLM: executedLLM}
 	}
 	return details
+}
+
+func benchmarkPromptInput(events []normalizer.Event) llm.PromptInput {
+	session := llm.NewSessionContext("", "general", time.Time{})
+	for _, ev := range events {
+		session.AddEvent(ev, 0, ev.TS)
+	}
+	return llm.PromptInput{TotalEvents: len(events), Stats: llm.CalculateAnomalyScore(events), BehaviorContext: session.BuildContext()}
 }
 
 func prepareDataset() []benchmark.Sample {
