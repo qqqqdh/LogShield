@@ -61,43 +61,36 @@ func (t *WindowTracker) Add(key string, now time.Time) (WindowMatch, bool) {
 		return list[i].Before(list[j])
 	})
 	cutoff := now.Add(-t.window)
+	latest := now.Add(t.window)
 	kept := list[:0]
-	eligible := make([]time.Time, 0, len(list))
+	// shortcut: retain one window on either side of this arrival; sort historical
+	// replays first when events can jump between distant time segments.
 	for _, ts := range list {
-		if ts.Before(cutoff) {
-			continue
-		}
-		kept = append(kept, ts)
-		// A late-arriving event must not make future events count in its window.
-		if !ts.After(now) {
-			eligible = append(eligible, ts)
+		if !ts.Before(cutoff) && !ts.After(latest) {
+			kept = append(kept, ts)
 		}
 	}
 
+	var match WindowMatch
+	start := 0
+	for end, ts := range kept {
+		for ts.Sub(kept[start]) > t.window {
+			start++
+		}
+		if end-start+1 >= t.threshold {
+			match = WindowMatch{Count: end - start + 1, First: kept[start], Last: ts}
+			kept = append(kept[:start], kept[end+1:]...)
+			break
+		}
+	}
 	if len(kept) == 0 {
 		delete(t.events, key)
 		delete(t.lastSeen, key)
-		return WindowMatch{}, false
-	}
-	if len(eligible) < t.threshold {
-		t.events[key] = kept
-		return WindowMatch{}, false
-	}
-
-	match := WindowMatch{
-		Count: len(eligible),
-		First: eligible[0],
-		Last:  eligible[len(eligible)-1],
-	}
-	// Keep future events so they can be evaluated when their timestamps arrive.
-	remaining := kept[len(eligible):]
-	if len(remaining) == 0 {
-		delete(t.events, key)
-		delete(t.lastSeen, key)
 	} else {
-		t.events[key] = remaining
+		t.events[key] = kept
+		t.lastSeen[key] = kept[len(kept)-1]
 	}
-	return match, true
+	return match, match.Count > 0
 }
 
 // Prune removes expired history, including keys that have gone idle.
