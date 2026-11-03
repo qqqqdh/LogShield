@@ -10,9 +10,11 @@ import (
 
 // Record preserves rejected lines for callers' parse-error and non-event counters.
 type Record struct {
-	Line  string
-	Event Event
-	Err   error
+	Line       string
+	Path       string
+	LineNumber int
+	Event      Event
+	Err        error
 }
 
 // ReadBatch parses all files once and stably merges events by timestamp.
@@ -27,10 +29,15 @@ func ReadBatch(paths []string) ([]Record, error) {
 		}
 		scanner := bufio.NewScanner(file)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		lineNumber := 0
 		for scanner.Scan() {
+			lineNumber++
 			line := scanner.Text()
 			ev, err := ParseLineAt(line, reference)
-			records = append(records, Record{Line: line, Event: ev, Err: err})
+			if err != nil {
+				err = fmt.Errorf("%s:%d: %w", path, lineNumber, err)
+			}
+			records = append(records, Record{Line: line, Event: ev, Err: err, Path: path, LineNumber: lineNumber})
 		}
 		scanErr := scanner.Err()
 		closeErr := file.Close()
