@@ -2,16 +2,28 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
+	"go-logshield/internal/analyzer"
 	"go-logshield/internal/detector"
+	"go-logshield/internal/normalizer"
+	"go-logshield/internal/pkg/alertstore"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/nxadm/tail"
 )
 
 type Alert = detector.Result
+
+type alertMsg struct{ a Alert }
 
 type viewMode int
 
@@ -26,10 +38,15 @@ type model struct {
 	mode     viewMode
 
 	alerts   []Alert
+	pending  []Alert
 	selected int
 
 	statusLine string
-	height     int
+
+	// 통계(있으면 보기 좋음)
+	totalEvents   int
+	totalAlerts   int
+	droppedAlerts int
 }
 
 func initialModel() model {
@@ -37,23 +54,19 @@ func initialModel() model {
 		paused:     false,
 		showHelp:   true,
 		mode:       viewList,
-		alerts:     make([]Alert, 0, 50),
+		alerts:     make([]Alert, 0, 100),
+		pending:    make([]Alert, 0, maxStoredAlerts),
 		selected:   0,
-		statusLine: "",
-		height:     24,
+		statusLine: "실시간 로그 분석 시작됨 (q 종료, p 일시정지)",
 	}
-}
-
-type tickMsg time.Time
-
-func tick() tea.Cmd {
-	return tea.Tick(300*time.Millisecond, func(t time.Time) tea.Msg {
-		return tickMsg(t)
-	})
 }
 
 type savedMsg struct{ path string }
 type errMsg struct{ err error }
+type eventCountMsg struct{ n int }
+type statusMsg struct{ text string }
+
+const maxStoredAlerts = 100
 
 func saveReportCmd(alerts []Alert) tea.Cmd {
 	snapshot := make([]Alert, len(alerts))
@@ -72,9 +85,7 @@ func saveReportCmd(alerts []Alert) tea.Cmd {
 	}
 }
 
-func (m model) Init() tea.Cmd {
-	return tick()
-}
+func (m model) Init() tea.Cmd { return nil }
 
 func clamp(v, lo, hi int) int {
 	if v < lo {
@@ -86,6 +97,54 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
+func (m *model) appendAlert(a Alert) {
+	if len(m.alerts) >= maxStoredAlerts {
+		m.alerts = m.alerts[1:]
+		m.selected = clamp(m.selected-1, 0, len(m.alerts)-1)
+	}
+	m.alerts = append(m.alerts, a)
+	m.selected = clamp(m.selected, 0, len(m.alerts)-1)
+}
+
+func severityRank(severity string) int {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "치명", "critical":
+		return 4
+	case "높음", "high":
+		return 3
+	case "중간", "medium":
+		return 2
+	case "낮음", "low":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// Keep the most severe alerts. Within one severity, retain newer event times;
+// equal timestamps prefer the alert received later.
+func (m *model) queueAlert(a Alert) {
+	if len(m.pending) < maxStoredAlerts {
+		m.pending = append(m.pending, a)
+		return
+	}
+	worst := 0
+	for i := 1; i < len(m.pending); i++ {
+		candidate, current := m.pending[i], m.pending[worst]
+		if severityRank(candidate.Severity) < severityRank(current.Severity) ||
+			(severityRank(candidate.Severity) == severityRank(current.Severity) && candidate.TS.Before(current.TS)) {
+			worst = i
+		}
+	}
+	current := m.pending[worst]
+	if severityRank(a.Severity) > severityRank(current.Severity) ||
+		(severityRank(a.Severity) == severityRank(current.Severity) && !a.TS.Before(current.TS)) {
+		copy(m.pending[worst:], m.pending[worst+1:])
+		m.pending[len(m.pending)-1] = a
+	}
+	m.droppedAlerts++
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch x := msg.(type) {
 
@@ -95,36 +154,59 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch k {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+
 		case "h", "?":
 			m.showHelp = !m.showHelp
 			return m, nil
+
 		case "p":
 			m.paused = !m.paused
 			if m.paused {
-				m.statusLine = "⏸ 일시정지됨 (p로 재개)"
+				m.statusLine = "⏸ 일시정지됨 (p로 재개) — 경고는 잠깐 멈춤"
 			} else {
+				sort.SliceStable(m.pending, func(i, j int) bool {
+					return m.pending[i].TS.Before(m.pending[j].TS)
+				})
+				for _, alert := range m.pending {
+					m.appendAlert(alert)
+				}
+				m.pending = nil
 				m.statusLine = "▶ 분석 재개됨"
 			}
 			return m, nil
+
 		case "c":
 			m.alerts = nil
+			m.pending = nil
 			m.selected = 0
 			m.mode = viewList
-			m.statusLine = "\U0001f9f9 경고 목록 초기화"
+			m.totalEvents = 0
+			m.totalAlerts = 0
+			m.droppedAlerts = 0
+			m.statusLine = "🧹 초기화 완료"
 			return m, nil
+
 		case "s":
-			if len(m.alerts) == 0 {
+			if len(m.alerts)+len(m.pending) == 0 {
 				m.statusLine = "저장할 경고가 없습니다."
 				return m, nil
 			}
-			m.statusLine = "\U0001f4be report.json 저장 중..."
-			return m, saveReportCmd(m.alerts)
+			reportAlerts := make([]Alert, 0, len(m.alerts)+len(m.pending))
+			reportAlerts = append(reportAlerts, m.alerts...)
+			reportAlerts = append(reportAlerts, m.pending...)
+			sort.SliceStable(reportAlerts, func(i, j int) bool {
+				return reportAlerts[i].TS.Before(reportAlerts[j].TS)
+			})
+			m.statusLine = "💾 report.json 저장 중..."
+			return m, saveReportCmd(reportAlerts)
+
 		case "esc":
 			if m.mode == viewDetail {
 				m.mode = viewList
 				m.statusLine = "리스트로 돌아옴"
 			}
 			return m, nil
+
 		case "enter":
 			if len(m.alerts) == 0 {
 				return m, nil
@@ -137,61 +219,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// 화면은 역순(최신=맸위=높은 인덱스)이라 위쪽 = 인덱스 증가
 		if m.mode == viewList && len(m.alerts) > 0 {
 			switch k {
 			case "up", "k":
+				// 화면은 역순(최신=맨위=높은 인덱스)이므로 위쪽 = 인덱스 증가
 				m.selected = clamp(m.selected+1, 0, len(m.alerts)-1)
 				return m, nil
 			case "down", "j":
 				m.selected = clamp(m.selected-1, 0, len(m.alerts)-1)
 				return m, nil
 			case "g":
+				// 화면 맨 위 = 가장 높은 인덱스
 				m.selected = len(m.alerts) - 1
 				return m, nil
 			case "G":
+				// 화면 맨 아래 = 인덱스 0
 				m.selected = 0
 				return m, nil
 			}
 		}
 
-	case tickMsg:
-		if !m.paused {
-			if len(m.alerts) < 50 {
-				sev := "중간"
-				title := "웹 경로 스캐닝 의심(데모)"
-				msg := "민감 경로에 대한 접근이 반복되었습니다."
-
-				n := int(time.Now().UnixNano() % 3)
-
-				switch n {
-				case 0:
-					sev = "높음"
-					title = "로그인 브루트포스 의심(데모)"
-					msg = "동일 IP에서 로그인 실패가 짧은 시간에 반복되었습니다."
-				case 1:
-					sev = "높음"
-					title = "SSH 브루트포스 의심(데모)"
-					msg = "동일 IP에서 SSH 인증 실패가 짧은 시간에 반복되었습니다."
-				}
-
-				m.alerts = append(m.alerts, Alert{
-					TS:       time.Now(),
-					Severity: sev,
-					Title:    title,
-					Message:  msg,
-					IP:       "198.51.100.23",
-					RuleID:   "DEMO_RULE",
-					Service:  "demo",
-				})
-
-				m.selected = clamp(m.selected, 0, len(m.alerts)-1)
-			}
+	case alertMsg:
+		m.totalAlerts++
+		if m.paused {
+			m.queueAlert(x.a)
+			return m, nil
 		}
-		return m, tick()
+		m.appendAlert(x.a)
+		m.statusLine = fmt.Sprintf("🚨 새 경고: %s", x.a.Title)
+		return m, nil
 
-	case tea.WindowSizeMsg:
-		m.height = x.Height
+	case eventCountMsg:
+		m.totalEvents += x.n
 		return m, nil
 
 	case savedMsg:
@@ -201,19 +260,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.statusLine = fmt.Sprintf("❌ 오류: %v", x.err)
 		return m, nil
+
+	case statusMsg:
+		m.statusLine = x.text
+		return m, nil
 	}
 
 	return m, nil
-}
-
-func countLines(s string) int {
-	n := 0
-	for _, c := range s {
-		if c == '\n' {
-			n++
-		}
-	}
-	return n
 }
 
 func (m model) View() string {
@@ -222,9 +275,11 @@ func (m model) View() string {
 		state = "PAUSED"
 	}
 
-	header := "Go-LogShield TUI\n"
-	header += fmt.Sprintf("상태: %s | 경고 수: %d | 모드: %s\n",
-		state, len(m.alerts), map[viewMode]string{viewList: "LIST", viewDetail: "DETAIL"}[m.mode],
+	header := ""
+	header += "Go-LogShield TUI (실시간 로그 분석)\n"
+	header += fmt.Sprintf("상태: %s | 이벤트: %d | 경고: %d | 대기: %d/%d | 버림: %d | 모드: %s\n",
+		state, m.totalEvents, m.totalAlerts, len(m.pending), maxStoredAlerts, m.droppedAlerts,
+		map[viewMode]string{viewList: "LIST", viewDetail: "DETAIL"}[m.mode],
 	)
 	if m.statusLine != "" {
 		header += m.statusLine + "\n"
@@ -236,39 +291,20 @@ func (m model) View() string {
 		help += "단축키\n"
 		help += "  q: 종료   p: 일시정지/재개   c: 초기화   s: report.json 저장\n"
 		help += "  h/?: 도움말 토글   ↑/k ↓/j: 이동   enter: 상세보기 토글   esc: 리스트로\n"
-		help += "  g: 맸위   G: 맸아래\n"
+		help += "  g: 맨위   G: 맨아래\n"
 		help += "--------------------------------------------------\n"
 	}
 
 	if len(m.alerts) == 0 {
-		return header + help + "(아직 경고 없음)\n"
+		return header + help + "(아직 경고 없음 — 로그를 계속 따라가는 중)\n"
 	}
 
 	if m.mode == viewList {
-		listTitle := "최근 경고 목록 (enter로 상세보기)\n\n"
-		fixedLines := countLines(header+help+listTitle) + 1
+		out := header + help
+		out += "최근 경고 목록 (enter로 상세보기)\n\n"
 
-		listHeight := m.height - fixedLines
-		if listHeight < 1 {
-			listHeight = 1
-		}
-
-		// selected 의 화면 위치 (0 = 맸위 = 최신)
-		displaySelected := len(m.alerts) - 1 - m.selected
-
-		scrollTop := displaySelected - listHeight/2
-		if scrollTop < 0 {
-			scrollTop = 0
-		}
-		if scrollTop+listHeight > len(m.alerts) {
-			scrollTop = len(m.alerts) - listHeight
-			if scrollTop < 0 {
-				scrollTop = 0
-			}
-		}
-
-		out := header + help + listTitle
-		for i := scrollTop; i < scrollTop+listHeight && i < len(m.alerts); i++ {
+		// 최신이 아래에 쌓이지만 보기 편하게 최근순 역순 출력
+		for i := 0; i < len(m.alerts); i++ {
 			idx := len(m.alerts) - 1 - i
 			a := m.alerts[idx]
 
@@ -278,20 +314,18 @@ func (m model) View() string {
 			}
 
 			out += fmt.Sprintf("%s[%s] %s  (%s)\n",
-				cursor,
-				a.Severity,
-				a.Title,
-				a.TS.Format("15:04:05"),
+				cursor, a.Severity, a.Title, a.TS.Format("15:04:05"),
 			)
 		}
+		out += "\n"
 		return out
 	}
 
-	// 상세 모드
+	// DETAIL
 	a := m.alerts[m.selected]
 	out := header + help
 	out += "상세 보기 (esc 또는 enter로 돌아가기)\n\n"
-	out += fmt.Sprintf("\U0001f6a8 제목: %s\n", a.Title)
+	out += fmt.Sprintf("🚨 제목: %s\n", a.Title)
 	out += fmt.Sprintf("등급: %s\n", a.Severity)
 	out += fmt.Sprintf("시간: %s\n", a.TS.Format(time.RFC3339))
 	if a.IP != "" {
@@ -303,14 +337,153 @@ func (m model) View() string {
 	if a.RuleID != "" {
 		out += fmt.Sprintf("RuleID: %s\n", a.RuleID)
 	}
-	out += "\n설명\n"
-	out += fmt.Sprintf("  %s\n", a.Message)
+	out += "\n원문 메시지\n"
+	out += a.Message + "\n"
 	return out
 }
 
+type rawLine struct {
+	path string
+	text string
+}
+
+// One worker owns the analyzer, so events from different files cannot
+// interleave detector state updates.
+func runRealtimeWorker(lines <-chan rawLine, stop <-chan struct{}, engine *analyzer.Analyzer, journal *alertstore.Journal, emit func(tea.Msg)) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			engine.Prune(time.Now())
+		case item, ok := <-lines:
+			if !ok {
+				return
+			}
+			emit(eventCountMsg{n: 1})
+			_, results, err := engine.ProcessLine(item.text)
+			if errors.Is(err, normalizer.ErrNonEvent) {
+				continue
+			}
+			if err != nil {
+				emit(errMsg{err: fmt.Errorf("parse error (%s): %w", item.path, err)})
+				continue
+			}
+			for _, result := range results {
+				if err := journal.Append(result); err != nil {
+					emit(errMsg{err: fmt.Errorf("alert journal: %w", err)})
+				}
+				emit(alertMsg{a: result})
+			}
+		}
+	}
+}
+
+// --- 실시간 tail + 분석 파이프라인 ---
+// stopFn()을 호출하면 모든 tailer goroutine이 정리됩니다.
+func startRealtimePipeline(p *tea.Program, logDir, alertPath string) (stopFn func(), err error) {
+	pattern := filepath.Join(logDir, "*.log")
+	paths, err := filepath.Glob(pattern)
+	if err != nil {
+		return func() {}, err
+	}
+	if len(paths) == 0 {
+		p.Send(errMsg{err: fmt.Errorf("%s 파일을 찾지 못했습니다. 로그 디렉터리를 확인하세요.", pattern)})
+		return func() {}, nil
+	}
+
+	journal, err := alertstore.Open(alertPath)
+	if err != nil {
+		return func() {}, fmt.Errorf("open alert journal: %w", err)
+	}
+	engine := analyzer.NewDefault()
+	lines := make(chan rawLine, 1024)
+	stopWorker := make(chan struct{})
+	var producers sync.WaitGroup
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		runRealtimeWorker(lines, stopWorker, engine, journal, p.Send)
+	}()
+
+	tailers := make([]*tail.Tail, 0, len(paths))
+
+	for _, path := range paths {
+		path := path
+		t, err := tail.TailFile(path, tail.Config{
+			Follow:    true,
+			ReOpen:    true,
+			MustExist: false,
+			Poll:      true,
+			Logger:    tail.DiscardingLogger,
+		})
+		if err != nil {
+			p.Send(errMsg{err: fmt.Errorf("tail 실패 (%s): %w", path, err)})
+			continue
+		}
+		tailers = append(tailers, t)
+
+		producers.Add(1)
+		go func() {
+			defer producers.Done()
+			for line := range t.Lines {
+				if line == nil {
+					continue
+				}
+				raw := strings.TrimSpace(line.Text)
+				if raw == "" {
+					continue
+				}
+				select {
+				case lines <- rawLine{path: path, text: raw}:
+				case <-stopWorker:
+					return
+				}
+			}
+		}()
+	}
+
+	p.Send(statusMsg{text: fmt.Sprintf("실시간 tail 시작: %d개 파일 (%s)", len(tailers), pattern)})
+
+	// Stop producers, then drain the bounded queue.
+	return func() {
+		for _, t := range tailers {
+			_ = t.Stop()
+			t.Cleanup()
+		}
+		producers.Wait()
+		close(lines)
+		<-workerDone
+		if err := journal.Close(); err != nil {
+			p.Send(errMsg{err: fmt.Errorf("close alert journal: %w", err)})
+		}
+	}, nil
+}
+
 func main() {
+	logDir := flag.String("log-dir", "./logs", "분석할 로그 파일이 위치한 디렉터리")
+	alertPath := flag.String("alerts-file", "alerts.jsonl", "모든 탐지 경고를 누적 저장할 JSONL 파일")
+	flag.Parse()
+
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		panic(err)
+
+	pipelineReady := make(chan func(), 1)
+	go func() {
+		stop, err := startRealtimePipeline(p, *logDir, *alertPath)
+		if err != nil {
+			p.Send(errMsg{err: err})
+			stop = func() {}
+		}
+		pipelineReady <- stop
+	}()
+
+	_, runErr := p.Run()
+	// TUI 종료 후 tailer goroutine 정리. 시작 goroutine이 아직 준비 중이어도
+	// 채널에서 cleanup 함수를 받은 뒤 반드시 정리한다.
+	(<-pipelineReady)()
+	if runErr != nil {
+		panic(runErr)
 	}
 }

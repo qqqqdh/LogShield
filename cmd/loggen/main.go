@@ -1,489 +1,159 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
-	"sync"
 	"time"
-
-	"go-logshield/internal/analyzer"
-	"go-logshield/internal/detector"
-	"go-logshield/internal/normalizer"
-	"go-logshield/internal/pkg/alertstore"
-
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/nxadm/tail"
 )
 
-type Alert = detector.Result
-
-type alertMsg struct{ a Alert }
-
-type viewMode int
-
-const (
-	viewList viewMode = iota
-	viewDetail
-)
-
-type model struct {
-	paused   bool
-	showHelp bool
-	mode     viewMode
-
-	alerts   []Alert
-	pending  []Alert
-	selected int
-
-	statusLine string
-
-	// 통계(있으면 보기 좋음)
-	totalEvents   int
-	totalAlerts   int
-	droppedAlerts int
-}
-
-func initialModel() model {
-	return model{
-		paused:     false,
-		showHelp:   true,
-		mode:       viewList,
-		alerts:     make([]Alert, 0, 100),
-		pending:    make([]Alert, 0, maxStoredAlerts),
-		selected:   0,
-		statusLine: "실시간 로그 분석 시작됨 (q 종료, p 일시정지)",
-	}
-}
-
-type savedMsg struct{ path string }
-type errMsg struct{ err error }
-type eventCountMsg struct{ n int }
-type statusMsg struct{ text string }
-
-const maxStoredAlerts = 100
-
-func saveReportCmd(alerts []Alert) tea.Cmd {
-	snapshot := make([]Alert, len(alerts))
-	copy(snapshot, alerts)
-
-	return func() tea.Msg {
-		b, err := json.MarshalIndent(snapshot, "", "  ")
-		if err != nil {
-			return errMsg{err: err}
-		}
-		path := "report.json"
-		if err := os.WriteFile(path, b, 0600); err != nil {
-			return errMsg{err: err}
-		}
-		return savedMsg{path: path}
-	}
-}
-
-func (m model) Init() tea.Cmd { return nil }
-
-func clamp(v, lo, hi int) int {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
-}
-
-func (m *model) appendAlert(a Alert) {
-	if len(m.alerts) >= maxStoredAlerts {
-		m.alerts = m.alerts[1:]
-		m.selected = clamp(m.selected-1, 0, len(m.alerts)-1)
-	}
-	m.alerts = append(m.alerts, a)
-	m.selected = clamp(m.selected, 0, len(m.alerts)-1)
-}
-
-func severityRank(severity string) int {
-	switch strings.ToLower(strings.TrimSpace(severity)) {
-	case "치명", "critical":
-		return 4
-	case "높음", "high":
-		return 3
-	case "중간", "medium":
-		return 2
-	case "낮음", "low":
-		return 1
-	default:
-		return 0
-	}
-}
-
-// Keep the most severe alerts. Within one severity, retain newer event times;
-// equal timestamps prefer the alert received later.
-func (m *model) queueAlert(a Alert) {
-	if len(m.pending) < maxStoredAlerts {
-		m.pending = append(m.pending, a)
-		return
-	}
-	worst := 0
-	for i := 1; i < len(m.pending); i++ {
-		candidate, current := m.pending[i], m.pending[worst]
-		if severityRank(candidate.Severity) < severityRank(current.Severity) ||
-			(severityRank(candidate.Severity) == severityRank(current.Severity) && candidate.TS.Before(current.TS)) {
-			worst = i
-		}
-	}
-	current := m.pending[worst]
-	if severityRank(a.Severity) > severityRank(current.Severity) ||
-		(severityRank(a.Severity) == severityRank(current.Severity) && !a.TS.Before(current.TS)) {
-		copy(m.pending[worst:], m.pending[worst+1:])
-		m.pending[len(m.pending)-1] = a
-	}
-	m.droppedAlerts++
-}
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch x := msg.(type) {
-
-	case tea.KeyMsg:
-		k := x.String()
-
-		switch k {
-		case "q", "ctrl+c":
-			return m, tea.Quit
-
-		case "h", "?":
-			m.showHelp = !m.showHelp
-			return m, nil
-
-		case "p":
-			m.paused = !m.paused
-			if m.paused {
-				m.statusLine = "⏸ 일시정지됨 (p로 재개) — 경고는 잠깐 멈춤"
-			} else {
-				sort.SliceStable(m.pending, func(i, j int) bool {
-					return m.pending[i].TS.Before(m.pending[j].TS)
-				})
-				for _, alert := range m.pending {
-					m.appendAlert(alert)
-				}
-				m.pending = nil
-				m.statusLine = "▶ 분석 재개됨"
-			}
-			return m, nil
-
-		case "c":
-			m.alerts = nil
-			m.pending = nil
-			m.selected = 0
-			m.mode = viewList
-			m.totalEvents = 0
-			m.totalAlerts = 0
-			m.droppedAlerts = 0
-			m.statusLine = "🧹 초기화 완료"
-			return m, nil
-
-		case "s":
-			if len(m.alerts)+len(m.pending) == 0 {
-				m.statusLine = "저장할 경고가 없습니다."
-				return m, nil
-			}
-			reportAlerts := make([]Alert, 0, len(m.alerts)+len(m.pending))
-			reportAlerts = append(reportAlerts, m.alerts...)
-			reportAlerts = append(reportAlerts, m.pending...)
-			sort.SliceStable(reportAlerts, func(i, j int) bool {
-				return reportAlerts[i].TS.Before(reportAlerts[j].TS)
-			})
-			m.statusLine = "💾 report.json 저장 중..."
-			return m, saveReportCmd(reportAlerts)
-
-		case "esc":
-			if m.mode == viewDetail {
-				m.mode = viewList
-				m.statusLine = "리스트로 돌아옴"
-			}
-			return m, nil
-
-		case "enter":
-			if len(m.alerts) == 0 {
-				return m, nil
-			}
-			if m.mode == viewList {
-				m.mode = viewDetail
-			} else {
-				m.mode = viewList
-			}
-			return m, nil
-		}
-
-		if m.mode == viewList && len(m.alerts) > 0 {
-			switch k {
-			case "up", "k":
-				// 화면은 역순(최신=맨위=높은 인덱스)이므로 위쪽 = 인덱스 증가
-				m.selected = clamp(m.selected+1, 0, len(m.alerts)-1)
-				return m, nil
-			case "down", "j":
-				m.selected = clamp(m.selected-1, 0, len(m.alerts)-1)
-				return m, nil
-			case "g":
-				// 화면 맨 위 = 가장 높은 인덱스
-				m.selected = len(m.alerts) - 1
-				return m, nil
-			case "G":
-				// 화면 맨 아래 = 인덱스 0
-				m.selected = 0
-				return m, nil
-			}
-		}
-
-	case alertMsg:
-		m.totalAlerts++
-		if m.paused {
-			m.queueAlert(x.a)
-			return m, nil
-		}
-		m.appendAlert(x.a)
-		m.statusLine = fmt.Sprintf("🚨 새 경고: %s", x.a.Title)
-		return m, nil
-
-	case eventCountMsg:
-		m.totalEvents += x.n
-		return m, nil
-
-	case savedMsg:
-		m.statusLine = fmt.Sprintf("✅ 저장 완료: %s", x.path)
-		return m, nil
-
-	case errMsg:
-		m.statusLine = fmt.Sprintf("❌ 오류: %v", x.err)
-		return m, nil
-
-	case statusMsg:
-		m.statusLine = x.text
-		return m, nil
-	}
-
-	return m, nil
-}
-
-func (m model) View() string {
-	state := "RUNNING"
-	if m.paused {
-		state = "PAUSED"
-	}
-
-	header := ""
-	header += "Go-LogShield TUI (실시간 로그 분석)\n"
-	header += fmt.Sprintf("상태: %s | 이벤트: %d | 경고: %d | 대기: %d/%d | 버림: %d | 모드: %s\n",
-		state, m.totalEvents, m.totalAlerts, len(m.pending), maxStoredAlerts, m.droppedAlerts,
-		map[viewMode]string{viewList: "LIST", viewDetail: "DETAIL"}[m.mode],
-	)
-	if m.statusLine != "" {
-		header += m.statusLine + "\n"
-	}
-	header += "--------------------------------------------------\n"
-
-	help := ""
-	if m.showHelp {
-		help += "단축키\n"
-		help += "  q: 종료   p: 일시정지/재개   c: 초기화   s: report.json 저장\n"
-		help += "  h/?: 도움말 토글   ↑/k ↓/j: 이동   enter: 상세보기 토글   esc: 리스트로\n"
-		help += "  g: 맨위   G: 맨아래\n"
-		help += "--------------------------------------------------\n"
-	}
-
-	if len(m.alerts) == 0 {
-		return header + help + "(아직 경고 없음 — 로그를 계속 따라가는 중)\n"
-	}
-
-	if m.mode == viewList {
-		out := header + help
-		out += "최근 경고 목록 (enter로 상세보기)\n\n"
-
-		// 최신이 아래에 쌓이지만 보기 편하게 최근순 역순 출력
-		for i := 0; i < len(m.alerts); i++ {
-			idx := len(m.alerts) - 1 - i
-			a := m.alerts[idx]
-
-			cursor := "  "
-			if idx == m.selected {
-				cursor = "> "
-			}
-
-			out += fmt.Sprintf("%s[%s] %s  (%s)\n",
-				cursor, a.Severity, a.Title, a.TS.Format("15:04:05"),
-			)
-		}
-		out += "\n"
-		return out
-	}
-
-	// DETAIL
-	a := m.alerts[m.selected]
-	out := header + help
-	out += "상세 보기 (esc 또는 enter로 돌아가기)\n\n"
-	out += fmt.Sprintf("🚨 제목: %s\n", a.Title)
-	out += fmt.Sprintf("등급: %s\n", a.Severity)
-	out += fmt.Sprintf("시간: %s\n", a.TS.Format(time.RFC3339))
-	if a.IP != "" {
-		out += fmt.Sprintf("IP: %s\n", a.IP)
-	}
-	if a.Service != "" {
-		out += fmt.Sprintf("서비스: %s\n", a.Service)
-	}
-	if a.RuleID != "" {
-		out += fmt.Sprintf("RuleID: %s\n", a.RuleID)
-	}
-	out += "\n원문 메시지\n"
-	out += a.Message + "\n"
-	return out
-}
-
-type rawLine struct {
-	path string
-	text string
-}
-
-// One worker owns the analyzer, so events from different files cannot
-// interleave detector state updates.
-func runRealtimeWorker(lines <-chan rawLine, stop <-chan struct{}, engine *analyzer.Analyzer, journal *alertstore.Journal, emit func(tea.Msg)) {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-			engine.Prune(time.Now())
-		case item, ok := <-lines:
-			if !ok {
-				return
-			}
-			emit(eventCountMsg{n: 1})
-			_, results, err := engine.ProcessLine(item.text)
-			if errors.Is(err, normalizer.ErrNonEvent) {
-				continue
-			}
-			if err != nil {
-				emit(errMsg{err: fmt.Errorf("parse error (%s): %w", item.path, err)})
-				continue
-			}
-			for _, result := range results {
-				if err := journal.Append(result); err != nil {
-					emit(errMsg{err: fmt.Errorf("alert journal: %w", err)})
-				}
-				emit(alertMsg{a: result})
-			}
-		}
-	}
-}
-
-// --- 실시간 tail + 분석 파이프라인 ---
-// stopFn()을 호출하면 모든 tailer goroutine이 정리됩니다.
-func startRealtimePipeline(p *tea.Program, logDir, alertPath string) (stopFn func(), err error) {
-	pattern := filepath.Join(logDir, "*.log")
-	paths, err := filepath.Glob(pattern)
-	if err != nil {
-		return func() {}, err
-	}
-	if len(paths) == 0 {
-		p.Send(errMsg{err: fmt.Errorf("%s 파일을 찾지 못했습니다. 로그 디렉터리를 확인하세요.", pattern)})
-		return func() {}, nil
-	}
-
-	journal, err := alertstore.Open(alertPath)
-	if err != nil {
-		return func() {}, fmt.Errorf("open alert journal: %w", err)
-	}
-	engine := analyzer.NewDefault()
-	lines := make(chan rawLine, 1024)
-	stopWorker := make(chan struct{})
-	var producers sync.WaitGroup
-	workerDone := make(chan struct{})
-	go func() {
-		defer close(workerDone)
-		runRealtimeWorker(lines, stopWorker, engine, journal, p.Send)
-	}()
-
-	tailers := make([]*tail.Tail, 0, len(paths))
-
-	for _, path := range paths {
-		path := path
-		t, err := tail.TailFile(path, tail.Config{
-			Follow:    true,
-			ReOpen:    true,
-			MustExist: false,
-			Poll:      true,
-			Logger:    tail.DiscardingLogger,
-		})
-		if err != nil {
-			p.Send(errMsg{err: fmt.Errorf("tail 실패 (%s): %w", path, err)})
-			continue
-		}
-		tailers = append(tailers, t)
-
-		producers.Add(1)
-		go func() {
-			defer producers.Done()
-			for line := range t.Lines {
-				if line == nil {
-					continue
-				}
-				raw := strings.TrimSpace(line.Text)
-				if raw == "" {
-					continue
-				}
-				select {
-				case lines <- rawLine{path: path, text: raw}:
-				case <-stopWorker:
-					return
-				}
-			}
-		}()
-	}
-
-	p.Send(statusMsg{text: fmt.Sprintf("실시간 tail 시작: %d개 파일 (%s)", len(tailers), pattern)})
-
-	// Stop producers, then drain the bounded queue.
-	return func() {
-		for _, t := range tailers {
-			_ = t.Stop()
-			t.Cleanup()
-		}
-		producers.Wait()
-		close(lines)
-		<-workerDone
-		if err := journal.Close(); err != nil {
-			p.Send(errMsg{err: fmt.Errorf("close alert journal: %w", err)})
-		}
-	}, nil
-}
-
+// LogGenerator simulates network and authentication logs for LogShield testing.
 func main() {
-	logDir := flag.String("log-dir", "./logs", "분석할 로그 파일이 위치한 디렉터리")
-	alertPath := flag.String("alerts-file", "alerts.jsonl", "모든 탐지 경고를 누적 저장할 JSONL 파일")
+	outDir := flag.String("out", "./sample-logs", "Output directory for synthetic test logs")
+	count := flag.Int("count", 100, "Number of log entries per file (positive)")
+	force := flag.Bool("force", false, "Replace existing regular test log files in the output directory")
 	flag.Parse()
-
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-
-	pipelineReady := make(chan func(), 1)
-	go func() {
-		stop, err := startRealtimePipeline(p, *logDir, *alertPath)
-		if err != nil {
-			p.Send(errMsg{err: err})
-			stop = func() {}
-		}
-		pipelineReady <- stop
-	}()
-
-	_, runErr := p.Run()
-	// TUI 종료 후 tailer goroutine 정리. 시작 goroutine이 아직 준비 중이어도
-	// 채널에서 cleanup 함수를 받은 뒤 반드시 정리한다.
-	(<-pipelineReady)()
-	if runErr != nil {
-		panic(runErr)
+	if err := generateLogs(*outDir, *count, *force); err != nil {
+		log.Fatal(err)
 	}
+	fmt.Printf("Generated %d entries per file in %s (auth.log, ssh.log, web.log)\n", *count, *outDir)
+}
+
+func generateLogs(outDir string, count int, force bool) error {
+	if count <= 0 {
+		return errors.New("count must be positive")
+	}
+	if outDir == "" {
+		return errors.New("out directory must not be empty")
+	}
+	targets := []struct {
+		name  string
+		write func(io.Writer, time.Time, int) error
+	}{
+		{"auth.log", generateAuthLog}, {"ssh.log", generateSSHLog}, {"web.log", generateWebLog},
+	}
+	// Check every target before creating or replacing any output.
+	for _, target := range targets {
+		path := filepath.Join(outDir, target.name)
+		info, err := os.Lstat(path)
+		if err == nil {
+			if !force {
+				return fmt.Errorf("%w: %s (use -force to replace test logs)", os.ErrExist, path)
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("refusing non-regular target %s", path)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return err
+	}
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	// shortcut: forced replacement is per file; stage outputs if all-file atomicity becomes required.
+	if force {
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	}
+	start := time.Now()
+	for _, target := range targets {
+		path := filepath.Join(outDir, target.name)
+		file, err := os.OpenFile(path, flags, 0600)
+		if err != nil {
+			return fmt.Errorf("create %s: %w", path, err)
+		}
+		writeErr := target.write(file, start, count)
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			return fmt.Errorf("generate %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func generateAuthLog(writer io.Writer, startTime time.Time, count int) error {
+
+	users := []string{"alice", "bob", "charlie", "root", "admin"}
+	ips := []string{"10.0.0.5", "10.0.0.12", "192.168.1.100", "203.0.113.10"}
+
+	currTime := startTime.Add(-time.Duration(count) * time.Second)
+
+	for i := 0; i < count; i++ {
+		currTime = currTime.Add(time.Second)
+		ip := ips[rand.Intn(len(ips))]
+		user := users[rand.Intn(len(users))]
+
+		// Introduce Brute Force attack pattern (IP 203.0.113.10 rapidly failing)
+		status := "success"
+		if ip == "203.0.113.10" || rand.Float32() < 0.3 {
+			status = "FAIL"
+		}
+
+		line := fmt.Sprintf("%s service=auth action=login user=\"%s\" ip=\"%s\" status=\"%s\"\n",
+			currTime.Format(time.RFC3339), user, ip, status)
+		if _, err := io.WriteString(writer, line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func generateSSHLog(writer io.Writer, startTime time.Time, count int) error {
+
+	ips := []string{"198.51.100.23", "10.0.0.50", "172.16.0.4"}
+	currTime := startTime.Add(-time.Duration(count) * time.Second)
+
+	for i := 0; i < count; i++ {
+		currTime = currTime.Add(time.Second)
+		ip := ips[rand.Intn(len(ips))]
+
+		status := "success"
+		user := "ubuntu"
+		if ip == "198.51.100.23" {
+			status = "failed"
+			user = "root"
+		}
+
+		line := fmt.Sprintf("%s service=ssh action=login user=\"%s\" ip=\"%s\" status=\"%s\"\n",
+			currTime.Format(time.RFC3339), user, ip, status)
+		if _, err := io.WriteString(writer, line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func generateWebLog(writer io.Writer, startTime time.Time, count int) error {
+
+	normalPaths := []string{"/index.html", "/about", "/login", "/dashboard", "/api/v1/user"}
+	attackPaths := []string{"/.env", "/admin", "/wp-login.php", "/config.json", "/backup.sql"}
+	ips := []string{"192.168.1.15", "10.0.0.99", "198.51.100.45"}
+
+	currTime := startTime.Add(-time.Duration(count) * time.Second)
+
+	for i := 0; i < count; i++ {
+		currTime = currTime.Add(time.Second)
+		ip := ips[rand.Intn(len(ips))]
+
+		path := normalPaths[rand.Intn(len(normalPaths))]
+		status := "200"
+
+		// Introduce Web Scanning / Enumeration pattern (IP 198.51.100.45)
+		if ip == "198.51.100.45" {
+			path = attackPaths[rand.Intn(len(attackPaths))]
+			status = "404"
+		}
+
+		line := fmt.Sprintf("%s service=web action=get user=\"guest\" ip=\"%s\" status=\"%s\" path=\"%s\"\n",
+			currTime.Format(time.RFC3339), ip, status, path)
+		if _, err := io.WriteString(writer, line); err != nil {
+			return err
+		}
+	}
+	return nil
 }
