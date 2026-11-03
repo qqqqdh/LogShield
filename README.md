@@ -36,6 +36,12 @@ go run ./cmd/logaudit -input ./logs/fly.jsonl -output audit.json
 go run ./cmd/benchmark -dataset labeled.json -output benchmark_report.json -llm-timeout 120s
 ```
 
+두 브랜치에서 `loggen`은 생성기, `logshield-tui`는 실제 감시 화면입니다. 공통 감시 옵션은 `-log-dir ./logs`, `-alerts-file alerts.jsonl`입니다. 생성 옵션은 `-out ./sample-logs`, `-count 100`, `-force=false`입니다. 입력 폴더와 출력 폴더의 용도를 구분합니다.
+
+생성 대상 auth.log·ssh.log·web.log 중 기존 파일이 하나라도 있으면 기본 실행은 중단합니다. 테스트 로그를 의도적으로 교체할 때만 `go run ./cmd/loggen -out ./sample-logs -count 100 -force`를 사용하세요. 개수는 양수여야 하며 다른 파일은 변경하지 않습니다. 기본 생성 위치는 이전 `./logs`에서 `./sample-logs`로 바뀌었습니다. `-force`는 세 파일을 하나의 트랜잭션으로 교체하지 않으므로 오류 발생 시 일부 출력만 갱신될 수 있습니다. [명령 통일 명세](docs/command-consistency-spec.md)를 참고하세요.
+
+이전 main에서 감시용으로 쓰던 `loggen -log-dir ...`는 `logshield-tui -log-dir ...`로 바꿔야 합니다. LLM 전용 CLI 옵션과 브랜치별 TUI 세부 기능은 유지됩니다.
+
 기존에 발견한 파일을 tail하며 새 파일 자동 발견은 지원하지 않습니다. 배치 CLI는 전체 파일을 읽어 이벤트 시간순으로 합친 후 분석하므로 메모리가 입력 크기에 비례합니다. 실시간 탐지기는 제한된 상태를 유지하며 입력 시각 전후 한 시간창의 역순 도착을 결합합니다. 서로 먼 과거 구간의 임의 혼합을 완전히 복원하지는 않습니다.
 
 ## 분석과 저장의 의미
