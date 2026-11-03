@@ -49,7 +49,8 @@ func (d *BruteForceDetector) Process(ev normalizer.Event) (Result, bool) {
 	d.pruneBlocked(now)
 
 	if blockTime, exists := d.blocked[ip]; exists {
-		if now.Sub(blockTime) < d.cfg.Window {
+		delta := now.Sub(blockTime)
+		if delta > -d.cfg.Window && delta < d.cfg.Window {
 			return Result{}, false
 		}
 		delete(d.blocked, ip)
