@@ -2,9 +2,11 @@ package normalizer
 
 import (
 	"errors"
-	"net"
+	"fmt"
+	"net/netip"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -28,6 +30,37 @@ func ParseLine(line string) (Event, error) {
 // ParseLineAt uses the supplied clock to infer the year and timezone of
 // traditional syslog timestamps, which contain neither.
 func ParseLineAt(line string, reference time.Time) (Event, error) {
+	ev, err := parseLineAt(line, reference)
+	if err != nil {
+		return Event{}, err
+	}
+	if ev.IP != "" {
+		addr, err := netip.ParseAddr(ev.IP)
+		if err != nil || addr.Zone() != "" {
+			return Event{}, fmt.Errorf("invalid source IP %q", ev.IP)
+		}
+		ev.IP = addr.Unmap().String()
+	}
+	if ev.Service == "web" && ev.Status != "" {
+		status, err := strconv.Atoi(ev.Status)
+		if err != nil || len(ev.Status) != 3 || status < 100 || status > 599 {
+			return Event{}, fmt.Errorf("invalid HTTP status %q", ev.Status)
+		}
+	}
+	if ev.Service == "auth" || ev.Service == "ssh" {
+		switch strings.ToUpper(ev.Status) {
+		case "FAIL", "FAILED", "FAILURE":
+			ev.Status = "FAIL"
+		case "SUCCESS", "SUCCEEDED":
+			ev.Status = "SUCCESS"
+		default:
+			ev.Status = "UNKNOWN"
+		}
+	}
+	return ev, nil
+}
+
+func parseLineAt(line string, reference time.Time) (Event, error) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return Event{}, errors.New("empty line")
@@ -101,14 +134,6 @@ func parseProjectLine(line string) (Event, error) {
 	if ev.Service == "ssh" && ev.Action == "login" {
 		ev.Action = "auth"
 	}
-	if ev.Service == "auth" || ev.Service == "ssh" {
-		switch strings.ToUpper(ev.Status) {
-		case "FAIL", "FAILED", "FAILURE":
-			ev.Status = "FAIL"
-		case "SUCCESS", "SUCCEEDED":
-			ev.Status = "SUCCESS"
-		}
-	}
 
 	return ev, nil
 }
@@ -120,9 +145,6 @@ func parseOpenSSH(line string, reference time.Time) (Event, bool, error) {
 	match := openSSHLine.FindStringSubmatch(line)
 	if match == nil {
 		return Event{}, false, nil
-	}
-	if net.ParseIP(match[4]) == nil {
-		return Event{}, true, errors.New("invalid OpenSSH source IP")
 	}
 	if reference.IsZero() {
 		return Event{}, true, errors.New("missing reference time for syslog")
@@ -146,9 +168,6 @@ func parseWebAccess(line string) (Event, bool, error) {
 	match := webAccessLine.FindStringSubmatch(line)
 	if match == nil {
 		return Event{}, false, nil
-	}
-	if net.ParseIP(match[1]) == nil {
-		return Event{}, true, errors.New("invalid web source IP")
 	}
 	ts, err := time.Parse("02/Jan/2006:15:04:05 -0700", match[2])
 	if err != nil {

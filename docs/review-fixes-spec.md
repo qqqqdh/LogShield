@@ -1,5 +1,7 @@
 # Review fixes — 2026-11-03
 
+Historical specification: retry/two-attempt expectations below are superseded by [Parser and LLM validation changes](parser-validation-spec.md). Constructor timeout defaults remain 10s; the new CLI/benchmark default is 120s.
+
 Scope: shared detector state on both branches; LLM response validation, timeout defaults and benchmark counters on the LLM branch; branch-specific README commands. No production changes or raw-log commits.
 
 ## Atomic goals and independent checks
