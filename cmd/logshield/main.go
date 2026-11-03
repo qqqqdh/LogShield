@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 
 	"go-logshield/internal/analyzer"
@@ -30,33 +28,18 @@ func main() {
 	// 2) 공통 분석 파이프라인 초기화
 	engine := analyzer.NewDefault()
 
-	// 3) 로그 파일 순회
-	for _, file := range files {
-		fmt.Println("===", file, "===")
-		if err := processFile(file, engine); err != nil {
-			log.Fatal(err)
-		}
-	}
-}
-
-func processFile(path string, engine *analyzer.Analyzer) error {
-	fp, err := os.Open(path)
+	// 3) 파일 경계를 넘어 이벤트 시각순으로 분석
+	records, err := normalizer.ReadBatch(files)
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
-	defer fp.Close()
-
-	scanner := bufio.NewScanner(fp)
-	// A user-agent or request line can exceed Scanner's default 64 KiB limit.
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		ev, results, err := engine.ProcessLine(line)
+	for _, record := range records {
+		ev, err := record.Event, record.Err
 		if errors.Is(err, normalizer.ErrNonEvent) {
 			continue
 		}
 		if err != nil {
-			fmt.Println("PARSE_ERR:", err, "line:", line)
+			fmt.Println("PARSE_ERR:", err, "line:", record.Line)
 			continue
 		}
 
@@ -70,9 +53,8 @@ func processFile(path string, engine *analyzer.Analyzer) error {
 			ev.Status,
 			ev.Path,
 		)
-		for _, result := range results {
+		for _, result := range engine.Process(ev) {
 			fmt.Println(result.Message)
 		}
 	}
-	return scanner.Err()
 }
