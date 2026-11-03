@@ -113,18 +113,22 @@ func (e *Evaluator) ComputeDetailed(modeName string, predictions []PredictionDet
 			fn++
 		}
 
-		// Per-technique metrics
-		if groundTech != "" && groundTech != "None" {
-			if _, exists := techMap[groundTech]; !exists {
+		// A wrong technique is a miss for the truth and a false alarm for the prediction.
+		if truth && groundTech != "" && groundTech != "None" {
+			if techMap[groundTech] == nil {
 				techMap[groundTech] = &TechMetric{}
 			}
 			if p.IsAttack && p.TechniqueID == groundTech {
 				techMap[groundTech].TP++
-			} else if p.IsAttack && p.TechniqueID != groundTech {
-				techMap[groundTech].FP++
-			} else if !p.IsAttack {
+			} else {
 				techMap[groundTech].FN++
 			}
+		}
+		if p.IsAttack && p.TechniqueID != "" && p.TechniqueID != "None" && (!truth || p.TechniqueID != groundTech) {
+			if techMap[p.TechniqueID] == nil {
+				techMap[p.TechniqueID] = &TechMetric{}
+			}
+			techMap[p.TechniqueID].FP++
 		}
 	}
 

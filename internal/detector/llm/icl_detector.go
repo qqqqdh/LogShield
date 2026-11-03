@@ -79,7 +79,7 @@ func NewOllamaClient(config OllamaClientConfig) *OllamaClient {
 	if config.ModelName == "" {
 		config.ModelName = "llama3.1:8b"
 	}
-	if config.Timeout == 0 {
+	if config.Timeout <= 0 {
 		config.Timeout = 10 * time.Second
 	}
 	return &OllamaClient{
@@ -157,14 +157,16 @@ func NewICLDetector(config ICLDetectorConfig) *ICLDetector {
 		ModelName: config.ModelName,
 		Timeout:   config.Timeout,
 	})
-	return &ICLDetector{
-		config:    config,
-		generator: NewPromptGenerator(),
-		client:    ollamaClient,
-	}
+	config.OllamaURL = ollamaClient.config.OllamaURL
+	config.ModelName = ollamaClient.config.ModelName
+	config.Timeout = ollamaClient.config.Timeout
+	return NewICLDetectorWithClient(config, ollamaClient)
 }
 
 func NewICLDetectorWithClient(config ICLDetectorConfig, client InferenceClient) *ICLDetector {
+	if config.Timeout <= 0 {
+		config.Timeout = 10 * time.Second
+	}
 	return &ICLDetector{
 		config:    config,
 		generator: NewPromptGenerator(),
@@ -268,6 +270,16 @@ func (d *ICLDetector) parseAndValidate(respText string) (LLMResponsePayload, err
 		return payload, fmt.Errorf("JSON parse error: %w (raw response: %s)", err, truncateString(respText, 100)), nil
 	}
 
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(rawJSON), &fields); err != nil {
+		return payload, err, nil
+	}
+	for _, key := range []string{"is_attack", "confidence", "findings"} {
+		value, exists := fields[key]
+		if !exists || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return payload, nil, fmt.Errorf("schema validation error: %s is required and must not be null", key)
+		}
+	}
 	if err := validatePayload(payload); err != nil {
 		return payload, nil, fmt.Errorf("schema validation error: %w", err)
 	}

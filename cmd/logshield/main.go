@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -168,9 +167,9 @@ func main() {
 		appendRuleReport(&report, r)
 	}
 
-	processLogLine := func(line string) {
+	processLogRecord := func(record normalizer.Record) {
 		totalLogsRead++
-		ev, err := normalizer.ParseLine(line)
+		ev, err := record.Event, record.Err
 		if errors.Is(err, normalizer.ErrNonEvent) {
 			report.NonEventRecords++
 			return
@@ -270,6 +269,11 @@ func main() {
 		}
 	}
 
+	processLogLine := func(line string) {
+		ev, err := normalizer.ParseLine(line)
+		processLogRecord(normalizer.Record{Line: line, Event: ev, Err: err})
+	}
+
 	watchFailures := 0
 	if *watchMode {
 		fmt.Printf("📡 [Real-Time Watcher] Tailing %d log files in real-time (Press Ctrl+C to stop)...\n", len(files))
@@ -299,25 +303,12 @@ func main() {
 			log.Print(err)
 		}
 	} else {
-		// Batch processing mode
-		for _, file := range files {
-			fmt.Printf("🔍 === Analyzing Log File: %s ===\n", file)
-			fp, err := os.Open(file)
-			if err != nil {
-				log.Fatal(err)
-			}
-			scanner := bufio.NewScanner(fp)
-			scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-			for scanner.Scan() {
-				processLogLine(scanner.Text())
-			}
-			if err := scanner.Err(); err != nil {
-				_ = fp.Close()
-				log.Fatalf("scan %s: %v", file, err)
-			}
-			if err := fp.Close(); err != nil {
-				log.Fatalf("close %s: %v", file, err)
-			}
+		records, err := normalizer.ReadBatch(files)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, record := range records {
+			processLogRecord(record)
 		}
 	}
 
